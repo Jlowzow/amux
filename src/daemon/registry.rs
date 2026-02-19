@@ -78,11 +78,6 @@ impl Registry {
         self.sessions.get(name)
     }
 
-    /// Get a mutable session by name.
-    pub fn get_mut(&mut self, name: &str) -> Option<&mut Session> {
-        self.sessions.get_mut(name)
-    }
-
     /// Remove dead sessions (reaper).
     pub fn reap_dead(&mut self) -> Vec<String> {
         let dead: Vec<String> = self

@@ -157,10 +157,10 @@ async fn handle_attach(
     cols: u16,
     rows: u16,
 ) {
-    // Get session handles.
+    // Get session handles (brief lock, no scrollback mutation needed).
     let (input_tx, mut output_rx, resize_tx, scrollback_data) = {
-        let mut reg = registry.lock().await;
-        let session = match reg.get_mut(name) {
+        let reg = registry.lock().await;
+        let session = match reg.get(name) {
             Some(s) => s,
             None => {
                 let _ = write_frame_async(
@@ -172,36 +172,36 @@ async fn handle_attach(
             }
         };
 
-        // Resize to client's terminal size.
-        let _ = session.resize_tx.send((cols, rows)).await;
-
         let input_tx = session.input_tx.clone();
         let output_rx = session.output_tx.subscribe();
         let resize_tx = session.resize_tx.clone();
-        let scrollback = session.scrollback.contents();
+        // Read scrollback from the session's Arc (short std::sync::Mutex lock).
+        let scrollback = session
+            .scrollback
+            .lock()
+            .map(|sb| sb.contents())
+            .unwrap_or_default();
 
         (input_tx, output_rx, resize_tx, scrollback)
     };
+
+    // Resize to client's terminal size (outside registry lock).
+    let _ = resize_tx.send((cols, rows)).await;
 
     // Send scrollback first.
     if !scrollback_data.is_empty() {
         let _ = write_frame_async(writer, &DaemonMessage::Output(scrollback_data)).await;
     }
 
-    // Bidirectional streaming.
+    // Bidirectional streaming (no registry lock needed in the hot path).
     loop {
         tokio::select! {
             // Output from PTY → client.
             output = output_rx.recv() => {
                 match output {
                     Ok(data) => {
-                        // Also store in scrollback.
-                        {
-                            let mut reg = registry.lock().await;
-                            if let Some(session) = reg.get_mut(name) {
-                                session.scrollback.push(&data);
-                            }
-                        }
+                        // Scrollback is now stored by io_loop in session.rs,
+                        // so no registry lock needed here.
                         if write_frame_async(writer, &DaemonMessage::Output(data)).await.is_err() {
                             return; // Client disconnected.
                         }

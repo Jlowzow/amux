@@ -28,6 +28,7 @@ pub fn write_pid_file(pid: u32) -> io::Result<()> {
 }
 
 /// Read the daemon PID from the pid file.
+#[allow(dead_code)]
 pub fn read_pid_file() -> io::Result<u32> {
     let path = runtime_dir().join("server.pid");
     let contents = std::fs::read_to_string(path)?;

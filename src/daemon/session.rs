@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command as StdCommand;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use nix::libc;
 use nix::pty::{openpty, Winsize};
@@ -19,8 +20,7 @@ pub struct Session {
     pub output_tx: broadcast::Sender<Vec<u8>>,
     pub resize_tx: mpsc::Sender<(u16, u16)>,
     pub kill_tx: Option<oneshot::Sender<()>>,
-    pub scrollback: Scrollback,
-    master_fd: i32,
+    pub scrollback: Arc<StdMutex<Scrollback>>,
 }
 
 pub struct Scrollback {
@@ -65,7 +65,6 @@ impl Session {
 
         // Open a PTY pair.
         let pty = openpty(Some(&winsize), None)?;
-        let master_fd = pty.master.as_raw_fd();
         let slave_fd = pty.slave.as_raw_fd();
 
         // Set slave to raw mode equivalent (disable echo/canon for agents).
@@ -107,9 +106,15 @@ impl Session {
         // Close slave side in parent.
         drop(pty.slave);
 
-        // Keep master_fd alive by leaking the OwnedFd (we manage it manually).
+        // Keep master_fd alive by leaking the OwnedFd (io_loop takes ownership).
         let master_raw = pty.master.as_raw_fd();
         std::mem::forget(pty.master);
+
+        // Set non-blocking mode on master fd (required for AsyncFd).
+        unsafe {
+            let flags = libc::fcntl(master_raw, libc::F_GETFL);
+            libc::fcntl(master_raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
 
         // Create channels.
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -119,8 +124,21 @@ impl Session {
 
         let output_tx_clone = output_tx.clone();
         let command_str = cmd.join(" ");
+        let scrollback = Arc::new(StdMutex::new(Scrollback::new()));
+        let scrollback_clone = scrollback.clone();
 
-        let mut session = Session {
+        // Spawn the I/O task (owns the master fd via OwnedFd).
+        tokio::spawn(Self::io_loop(
+            master_raw,
+            child_pid,
+            input_rx,
+            output_tx_clone,
+            scrollback_clone,
+            resize_rx,
+            kill_rx,
+        ));
+
+        let session = Session {
             name,
             command: command_str,
             child_pid,
@@ -128,20 +146,8 @@ impl Session {
             output_tx,
             resize_tx,
             kill_tx: Some(kill_tx),
-            scrollback: Scrollback::new(),
-            master_fd: master_raw,
+            scrollback,
         };
-
-        // Spawn the I/O task.
-        // We use a separate task that owns the master fd.
-        tokio::spawn(Self::io_loop(
-            master_raw,
-            child_pid,
-            input_rx,
-            output_tx_clone,
-            resize_rx,
-            kill_rx,
-        ));
 
         Ok(session)
     }
@@ -151,10 +157,11 @@ impl Session {
         child_pid: nix::unistd::Pid,
         mut input_rx: mpsc::Receiver<Vec<u8>>,
         output_tx: broadcast::Sender<Vec<u8>>,
+        scrollback: Arc<StdMutex<Scrollback>>,
         mut resize_rx: mpsc::Receiver<(u16, u16)>,
         mut kill_rx: oneshot::Receiver<()>,
     ) {
-        // Wrap the master fd in async I/O.
+        // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
         let master_async = match tokio::io::unix::AsyncFd::new(master_file) {
             Ok(fd) => fd,
@@ -190,6 +197,10 @@ impl Session {
                                 Ok(Ok(0)) => break, // EOF
                                 Ok(Ok(n)) => {
                                     let data = read_buf[..n].to_vec();
+                                    // Store in scrollback (short critical section, no await).
+                                    if let Ok(mut sb) = scrollback.lock() {
+                                        sb.push(&data);
+                                    }
                                     let _ = output_tx.send(data);
                                 }
                                 Ok(Err(e)) => {
@@ -257,18 +268,59 @@ impl Session {
     }
 
     pub fn is_alive(&self) -> bool {
-        match nix::sys::signal::kill(self.child_pid, None) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        nix::sys::signal::kill(self.child_pid, None).is_ok()
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        // Close the master fd if still open.
-        unsafe {
-            libc::close(self.master_fd);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scrollback_basic() {
+        let mut sb = Scrollback::new();
+        sb.push(b"hello world");
+        assert_eq!(sb.contents(), b"hello world");
+    }
+
+    #[test]
+    fn test_scrollback_empty() {
+        let sb = Scrollback::new();
+        assert!(sb.contents().is_empty());
+    }
+
+    #[test]
+    fn test_scrollback_multiple_pushes() {
+        let mut sb = Scrollback::new();
+        sb.push(b"hello ");
+        sb.push(b"world");
+        assert_eq!(sb.contents(), b"hello world");
+    }
+
+    #[test]
+    fn test_scrollback_overflow() {
+        let mut sb = Scrollback::new();
+        // Fill to capacity
+        let data = vec![b'A'; SCROLLBACK_SIZE];
+        sb.push(&data);
+        assert_eq!(sb.contents().len(), SCROLLBACK_SIZE);
+
+        // Push more data, oldest should be evicted
+        sb.push(b"XYZ");
+        let contents = sb.contents();
+        assert_eq!(contents.len(), SCROLLBACK_SIZE);
+        // Last 3 bytes should be XYZ
+        assert_eq!(&contents[SCROLLBACK_SIZE - 3..], b"XYZ");
+        // First bytes should be A (shifted)
+        assert_eq!(contents[0], b'A');
+    }
+
+    #[test]
+    fn test_scrollback_exactly_at_capacity() {
+        let mut sb = Scrollback::new();
+        let data = vec![b'B'; SCROLLBACK_SIZE];
+        sb.push(&data);
+        assert_eq!(sb.contents().len(), SCROLLBACK_SIZE);
+        assert!(sb.contents().iter().all(|&b| b == b'B'));
     }
 }
