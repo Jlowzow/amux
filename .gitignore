@@ -1,3 +1,7 @@
 .runtime/
 .claude/commands/
 .logs/
+.beads/
+
+# Added by cargo
+/target
