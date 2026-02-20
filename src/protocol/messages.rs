@@ -13,6 +13,7 @@ pub enum ClientMessage {
     KillSession {
         name: String,
     },
+    KillAllSessions,
     Attach {
         name: String,
         cols: u16,
@@ -49,6 +50,10 @@ pub enum DaemonMessage {
     SessionEnded,
     /// Whether a session exists.
     SessionExists(bool),
+    /// Count of sessions killed in a bulk operation.
+    KilledSessions {
+        count: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

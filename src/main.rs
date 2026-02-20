@@ -41,12 +41,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Kill a session
+    /// Kill a session (or all sessions with --all)
     Kill {
         /// Target session name
-        #[arg(short = 't', long = "target")]
-        name: String,
+        #[arg(short = 't', long = "target", required_unless_present = "all")]
+        name: Option<String>,
+        /// Kill all sessions
+        #[arg(long)]
+        all: bool,
     },
+    /// Kill all sessions
+    KillAll,
     /// Send text to a session
     Send {
         /// Target session name
@@ -63,8 +68,12 @@ enum Command {
     },
     /// Start the daemon server
     StartServer,
-    /// Stop daemon and all sessions
-    KillServer,
+    /// Stop daemon (use --force to kill sessions first)
+    KillServer {
+        /// Kill all sessions before stopping the server
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Ping the server (health check)
     Ping,
 }
@@ -80,7 +89,35 @@ fn main() -> anyhow::Result<()> {
             }
             daemon::fork_daemon()?;
         }
-        Command::KillServer => {
+        Command::KillServer { force } => {
+            if force {
+                // Kill all sessions first, then stop the server.
+                let resp = client::request(&ClientMessage::KillAllSessions)?;
+                match resp {
+                    DaemonMessage::KilledSessions { count } => {
+                        if count > 0 {
+                            eprintln!("amux: killed {} session(s)", count);
+                        }
+                    }
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error killing sessions: {}", e);
+                    }
+                    _ => {}
+                }
+            } else {
+                // Check if sessions are running; refuse if so.
+                let resp = client::request(&ClientMessage::ListSessions)?;
+                if let DaemonMessage::SessionList(sessions) = resp {
+                    let alive: Vec<_> = sessions.iter().filter(|s| s.alive).collect();
+                    if !alive.is_empty() {
+                        eprintln!(
+                            "amux: {} session(s) still running (use --force to kill them)",
+                            alive.len()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             let resp = client::request(&ClientMessage::KillServer)?;
             match resp {
                 DaemonMessage::Ok => eprintln!("amux: server stopped"),
@@ -164,13 +201,22 @@ fn main() -> anyhow::Result<()> {
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
-        Command::Kill { name } => {
-            let resp = client::request(&ClientMessage::KillSession { name: name.clone() })?;
-            match resp {
-                DaemonMessage::Ok => eprintln!("amux: killed session '{}'", name),
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
-                other => eprintln!("amux: unexpected: {:?}", other),
+        Command::Kill { name, all } => {
+            if all {
+                do_kill_all()?;
+            } else {
+                let name = name.unwrap();
+                let resp =
+                    client::request(&ClientMessage::KillSession { name: name.clone() })?;
+                match resp {
+                    DaemonMessage::Ok => eprintln!("amux: killed session '{}'", name),
+                    DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
             }
+        }
+        Command::KillAll => {
+            do_kill_all()?;
         }
         Command::Send { name, text } => {
             let text_with_newline = format!("{}\n", text);
@@ -197,6 +243,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Kill all sessions via the daemon.
+fn do_kill_all() -> anyhow::Result<()> {
+    let resp = client::request(&ClientMessage::KillAllSessions)?;
+    match resp {
+        DaemonMessage::KilledSessions { count } => {
+            eprintln!("amux: killed {} session(s)", count);
+        }
+        DaemonMessage::Error(e) => {
+            eprintln!("amux: error: {}", e);
+            std::process::exit(1);
+        }
+        other => eprintln!("amux: unexpected: {:?}", other),
+    }
     Ok(())
 }
 

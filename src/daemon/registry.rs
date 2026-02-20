@@ -83,6 +83,20 @@ impl Registry {
         Ok(())
     }
 
+    /// Kill all sessions. Returns the number killed.
+    pub fn kill_all(&mut self) -> usize {
+        let names: Vec<String> = self.sessions.keys().cloned().collect();
+        let count = names.len();
+        for name in &names {
+            if let Some(mut session) = self.sessions.remove(name) {
+                if let Some(kill_tx) = session.kill_tx.take() {
+                    let _ = kill_tx.send(());
+                }
+            }
+        }
+        count
+    }
+
     /// Get a session by name.
     pub fn get(&self, name: &str) -> Option<&Session> {
         self.sessions.get(name)

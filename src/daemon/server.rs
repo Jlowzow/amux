@@ -119,6 +119,15 @@ async fn handle_connection(
                     }
                 }
             }
+            ClientMessage::KillAllSessions => {
+                let mut reg = registry.lock().await;
+                let count = reg.kill_all();
+                let _ = write_frame_async(
+                    &mut writer,
+                    &DaemonMessage::KilledSessions { count },
+                )
+                .await;
+            }
             ClientMessage::Attach { name, cols, rows } => {
                 // Handle attach: stream output from session.
                 handle_attach(&mut reader, &mut writer, registry.clone(), &name, cols, rows)
