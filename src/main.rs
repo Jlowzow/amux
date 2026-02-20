@@ -43,14 +43,6 @@ enum Command {
         #[arg(short = 't', long = "target")]
         name: String,
     },
-    /// Send text to a session
-    Send {
-        /// Target session name
-        #[arg(short = 't', long = "target")]
-        name: String,
-        /// Text to send (newline appended)
-        text: String,
-    },
     /// Start the daemon server
     StartServer,
     /// Stop daemon and all sessions
@@ -152,18 +144,6 @@ fn main() -> anyhow::Result<()> {
             let resp = client::request(&ClientMessage::KillSession { name: name.clone() })?;
             match resp {
                 DaemonMessage::Ok => eprintln!("amux: killed session '{}'", name),
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
-                other => eprintln!("amux: unexpected: {:?}", other),
-            }
-        }
-        Command::Send { name, text } => {
-            let text_with_newline = format!("{}\n", text);
-            let resp = client::request(&ClientMessage::SendText {
-                name: name.clone(),
-                text: text_with_newline,
-            })?;
-            match resp {
-                DaemonMessage::Ok => {}
                 DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
                 other => eprintln!("amux: unexpected: {:?}", other),
             }

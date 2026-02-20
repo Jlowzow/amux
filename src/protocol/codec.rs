@@ -163,24 +163,6 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_send_text() {
-        let msg = ClientMessage::SendText {
-            name: "mysession".to_string(),
-            text: "ls -la\n".to_string(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &msg).unwrap();
-        let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
-        match decoded {
-            ClientMessage::SendText { name, text } => {
-                assert_eq!(name, "mysession");
-                assert_eq!(text, "ls -la\n");
-            }
-            _ => panic!("expected SendText"),
-        }
-    }
-
-    #[test]
     fn test_frame_length_prefix() {
         let msg = ClientMessage::Ping;
         let mut buf = Vec::new();
