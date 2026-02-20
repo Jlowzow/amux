@@ -57,4 +57,8 @@ pub struct SessionInfo {
     pub command: String,
     pub pid: u32,
     pub alive: bool,
+    /// ISO 8601 timestamp of session creation.
+    pub created_at: String,
+    /// Seconds since session was created.
+    pub uptime_secs: u64,
 }

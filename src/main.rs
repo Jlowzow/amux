@@ -36,7 +36,11 @@ enum Command {
         name: String,
     },
     /// List sessions
-    Ls,
+    Ls {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a session
     Kill {
         /// Target session name
@@ -135,17 +139,23 @@ fn main() -> anyhow::Result<()> {
         Command::Attach { name } => {
             do_attach(&name)?;
         }
-        Command::Ls => {
+        Command::Ls { json } => {
             let resp = client::request(&ClientMessage::ListSessions)?;
             match resp {
                 DaemonMessage::SessionList(sessions) => {
-                    if sessions.is_empty() {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&sessions)
+                                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+                        );
+                    } else if sessions.is_empty() {
                         eprintln!("no sessions");
                     } else {
                         for s in &sessions {
                             let status = if s.alive { "" } else { " (dead)" };
                             println!(
-                                "{}: {} (pid {}){}", s.name, s.command, s.pid, status
+                                "{}: {} (pid {}, up {}s, created {}){}", s.name, s.command, s.pid, s.uptime_secs, s.created_at, status
                             );
                         }
                     }

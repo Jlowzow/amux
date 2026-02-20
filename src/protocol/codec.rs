@@ -124,12 +124,16 @@ mod tests {
                 command: "bash".to_string(),
                 pid: 1234,
                 alive: true,
+                created_at: "2026-02-20T12:00:00Z".to_string(),
+                uptime_secs: 60,
             },
             SessionInfo {
                 name: "s2".to_string(),
                 command: "vim".to_string(),
                 pid: 5678,
                 alive: false,
+                created_at: "2026-02-20T11:00:00Z".to_string(),
+                uptime_secs: 3660,
             },
         ]);
         let mut buf = Vec::new();
