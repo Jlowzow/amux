@@ -38,12 +38,13 @@ impl Registry {
         cmd: &[String],
         cols: u16,
         rows: u16,
+        env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<String> {
         let name = self.allocate_name(name);
         if self.sessions.contains_key(&name) {
             anyhow::bail!("session '{}' already exists", name);
         }
-        let session = Session::spawn(name.clone(), cmd, cols, rows)?;
+        let session = Session::spawn(name.clone(), cmd, cols, rows, env)?;
         self.sessions.insert(name.clone(), session);
         Ok(name)
     }
