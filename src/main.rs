@@ -81,6 +81,11 @@ enum Command {
         #[arg(short, long, default_value = "50")]
         lines: usize,
     },
+    /// Get or set session-level environment variables
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
     /// Start the daemon server
     StartServer,
     /// Stop daemon (use --force to kill sessions first)
@@ -91,6 +96,35 @@ enum Command {
     },
     /// Ping the server (health check)
     Ping,
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// Set an environment variable on a session
+    Set {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+        /// Variable name
+        key: String,
+        /// Variable value
+        value: String,
+    },
+    /// Get an environment variable from a session
+    Get {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+        /// Variable name
+        key: String,
+    },
+    /// List all environment variables on a session
+    #[command(alias = "ls")]
+    List {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -279,6 +313,59 @@ fn main() -> anyhow::Result<()> {
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
+        Command::Env { action } => match action {
+            EnvAction::Set { name, key, value } => {
+                let resp = client::request(&ClientMessage::SetEnv {
+                    name: name.clone(),
+                    key: key.clone(),
+                    value,
+                })?;
+                match resp {
+                    DaemonMessage::Ok => {}
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
+            }
+            EnvAction::Get { name, key } => {
+                let resp = client::request(&ClientMessage::GetEnv {
+                    name: name.clone(),
+                    key: key.clone(),
+                })?;
+                match resp {
+                    DaemonMessage::EnvValue(Some(val)) => println!("{}", val),
+                    DaemonMessage::EnvValue(None) => {
+                        std::process::exit(1);
+                    }
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
+            }
+            EnvAction::List { name } => {
+                let resp = client::request(&ClientMessage::GetAllEnv {
+                    name: name.clone(),
+                })?;
+                match resp {
+                    DaemonMessage::EnvVars(vars) => {
+                        let mut keys: Vec<_> = vars.keys().collect();
+                        keys.sort();
+                        for k in keys {
+                            println!("{}={}", k, vars[k]);
+                        }
+                    }
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
+            }
+        },
     }
 
     Ok(())

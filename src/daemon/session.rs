@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command as StdCommand;
@@ -22,6 +22,8 @@ pub struct Session {
     pub resize_tx: mpsc::Sender<(u16, u16)>,
     pub kill_tx: Option<oneshot::Sender<()>>,
     pub scrollback: Arc<StdMutex<Scrollback>>,
+    /// Session-level metadata environment variables (not process env).
+    pub env_vars: HashMap<String, String>,
 }
 
 pub struct Scrollback {
@@ -190,6 +192,7 @@ impl Session {
             resize_tx,
             kill_tx: Some(kill_tx),
             scrollback,
+            env_vars: HashMap::new(),
         };
 
         Ok(session)
@@ -414,5 +417,32 @@ mod tests {
         let mut sb = Scrollback::new();
         sb.push(b"a\nb\nc\n");
         assert_eq!(sb.last_lines(3), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn test_env_vars_set_get() {
+        let mut env = HashMap::new();
+        env.insert("GT_HOOK_STATUS".to_string(), "active".to_string());
+        assert_eq!(env.get("GT_HOOK_STATUS"), Some(&"active".to_string()));
+        assert_eq!(env.get("NONEXISTENT"), None);
+    }
+
+    #[test]
+    fn test_env_vars_overwrite() {
+        let mut env = HashMap::new();
+        env.insert("KEY".to_string(), "val1".to_string());
+        env.insert("KEY".to_string(), "val2".to_string());
+        assert_eq!(env.get("KEY"), Some(&"val2".to_string()));
+    }
+
+    #[test]
+    fn test_env_vars_list_all() {
+        let mut env = HashMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), "2".to_string());
+        let clone = env.clone();
+        assert_eq!(clone.len(), 2);
+        assert_eq!(clone.get("A"), Some(&"1".to_string()));
+        assert_eq!(clone.get("B"), Some(&"2".to_string()));
     }
 }

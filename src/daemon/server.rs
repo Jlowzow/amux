@@ -180,6 +180,47 @@ async fn handle_connection(
                     .await;
                 }
             }
+            ClientMessage::SetEnv { name, key, value } => {
+                let mut reg = registry.lock().await;
+                if let Some(session) = reg.get_mut(&name) {
+                    session.env_vars.insert(key, value);
+                    let _ = write_frame_async(&mut writer, &DaemonMessage::Ok).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
+            ClientMessage::GetEnv { name, key } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let value = session.env_vars.get(&key).cloned();
+                    let _ =
+                        write_frame_async(&mut writer, &DaemonMessage::EnvValue(value)).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
+            ClientMessage::GetAllEnv { name } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let vars = session.env_vars.clone();
+                    let _ =
+                        write_frame_async(&mut writer, &DaemonMessage::EnvVars(vars)).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,
