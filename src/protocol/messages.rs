@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Requests from client to daemon.
@@ -36,6 +38,18 @@ pub enum ClientMessage {
         name: String,
         lines: usize,
     },
+    SetEnv {
+        name: String,
+        key: String,
+        value: String,
+    },
+    GetEnv {
+        name: String,
+        key: String,
+    },
+    GetAllEnv {
+        name: String,
+    },
 }
 
 /// Responses from daemon to client.
@@ -60,6 +74,10 @@ pub enum DaemonMessage {
     },
     /// Captured scrollback output.
     CaptureOutput(Vec<u8>),
+    /// Value of a single environment variable (None if not set).
+    EnvValue(Option<String>),
+    /// All environment variables for a session.
+    EnvVars(HashMap<String, String>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
