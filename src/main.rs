@@ -11,7 +11,7 @@ use crate::protocol::messages::{ClientMessage, DaemonMessage};
 #[command(name = "amux", about = "AI Agent Multiplexer")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -130,7 +130,17 @@ enum EnvAction {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let command = cli.command.unwrap_or_else(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        Command::New {
+            name: None,
+            detached: false,
+            env: Vec::new(),
+            cmd: vec![shell],
+        }
+    });
+
+    match command {
         Command::StartServer => {
             if common::server_running() {
                 eprintln!("amux: server is already running");
