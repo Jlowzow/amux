@@ -52,13 +52,16 @@ enum Command {
     },
     /// Kill all sessions
     KillAll,
-    /// Send text to a session
+    /// Send keys to a session
     Send {
         /// Target session name
         #[arg(short = 't', long = "target")]
         name: String,
-        /// Text to send (newline appended)
-        text: String,
+        /// Send literal text without trailing newline
+        #[arg(short = 'l', long = "literal")]
+        literal: bool,
+        /// Text to send
+        text: Vec<String>,
     },
     /// Check if a session exists (exit 0 if yes, 1 if no)
     Has {
@@ -227,14 +230,19 @@ fn main() -> anyhow::Result<()> {
         Command::KillAll => {
             do_kill_all()?;
         }
-        Command::Send { name, text } => {
-            let text_with_newline = format!("{}\n", text);
-            let resp = client::request(&ClientMessage::SendText {
+        Command::Send {
+            name,
+            literal,
+            text,
+        } => {
+            let joined = text.join(" ");
+            let resp = client::request(&ClientMessage::SendInput {
                 name: name.clone(),
-                text: text_with_newline,
+                data: joined.into_bytes(),
+                newline: !literal,
             })?;
             match resp {
-                DaemonMessage::Ok => {}
+                DaemonMessage::InputSent => {}
                 DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
                 other => eprintln!("amux: unexpected: {:?}", other),
             }

@@ -167,21 +167,60 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_send_text() {
-        let msg = ClientMessage::SendText {
+    fn test_roundtrip_send_input() {
+        let msg = ClientMessage::SendInput {
             name: "mysession".to_string(),
-            text: "ls -la\n".to_string(),
+            data: b"ls -la".to_vec(),
+            newline: true,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
         match decoded {
-            ClientMessage::SendText { name, text } => {
+            ClientMessage::SendInput {
+                name,
+                data,
+                newline,
+            } => {
                 assert_eq!(name, "mysession");
-                assert_eq!(text, "ls -la\n");
+                assert_eq!(data, b"ls -la");
+                assert!(newline);
             }
-            _ => panic!("expected SendText"),
+            _ => panic!("expected SendInput"),
         }
+    }
+
+    #[test]
+    fn test_roundtrip_send_input_literal() {
+        let msg = ClientMessage::SendInput {
+            name: "sess".to_string(),
+            data: b"partial text".to_vec(),
+            newline: false,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
+        match decoded {
+            ClientMessage::SendInput {
+                name,
+                data,
+                newline,
+            } => {
+                assert_eq!(name, "sess");
+                assert_eq!(data, b"partial text");
+                assert!(!newline);
+            }
+            _ => panic!("expected SendInput"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_input_sent() {
+        let msg = DaemonMessage::InputSent;
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let decoded: DaemonMessage = read_frame(&mut &buf[..]).unwrap();
+        assert!(matches!(decoded, DaemonMessage::InputSent));
     }
 
     #[test]

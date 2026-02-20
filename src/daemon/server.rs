@@ -134,11 +134,20 @@ async fn handle_connection(
                     .await;
                 return; // Attach takes over the connection.
             }
-            ClientMessage::SendText { name, text } => {
+            ClientMessage::SendInput {
+                name,
+                data,
+                newline,
+            } => {
                 let reg = registry.lock().await;
                 if let Some(session) = reg.get(&name) {
-                    let _ = session.input_tx.send(text.into_bytes()).await;
-                    let _ = write_frame_async(&mut writer, &DaemonMessage::Ok).await;
+                    let mut payload = data;
+                    if newline {
+                        payload.push(b'\n');
+                    }
+                    let _ = session.input_tx.send(payload).await;
+                    let _ =
+                        write_frame_async(&mut writer, &DaemonMessage::InputSent).await;
                 } else {
                     let _ = write_frame_async(
                         &mut writer,

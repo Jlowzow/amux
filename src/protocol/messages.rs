@@ -25,9 +25,10 @@ pub enum ClientMessage {
         rows: u16,
     },
     Detach,
-    SendText {
+    SendInput {
         name: String,
-        text: String,
+        data: Vec<u8>,
+        newline: bool,
     },
     HasSession {
         name: String,
@@ -60,6 +61,8 @@ pub enum DaemonMessage {
     },
     /// Captured scrollback output.
     CaptureOutput(Vec<u8>),
+    /// Acknowledgement that input was sent to a session.
+    InputSent,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
