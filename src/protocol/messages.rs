@@ -24,6 +24,10 @@ pub enum ClientMessage {
         rows: u16,
     },
     Detach,
+    SendText {
+        name: String,
+        text: String,
+    },
 }
 
 /// Responses from daemon to client.

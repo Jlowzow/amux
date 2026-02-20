@@ -125,6 +125,19 @@ async fn handle_connection(
                     .await;
                 return; // Attach takes over the connection.
             }
+            ClientMessage::SendText { name, text } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let _ = session.input_tx.send(text.into_bytes()).await;
+                    let _ = write_frame_async(&mut writer, &DaemonMessage::Ok).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,
