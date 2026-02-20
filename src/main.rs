@@ -51,6 +51,12 @@ enum Command {
         /// Text to send (newline appended)
         text: String,
     },
+    /// Check if a session exists (exit 0 if yes, 1 if no)
+    Has {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+    },
     /// Start the daemon server
     StartServer,
     /// Stop daemon and all sessions
@@ -166,6 +172,17 @@ fn main() -> anyhow::Result<()> {
                 DaemonMessage::Ok => {}
                 DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
                 other => eprintln!("amux: unexpected: {:?}", other),
+            }
+        }
+        Command::Has { name } => {
+            let resp = client::request(&ClientMessage::HasSession { name });
+            match resp {
+                Ok(DaemonMessage::SessionExists(true)) => {
+                    std::process::exit(0);
+                }
+                _ => {
+                    std::process::exit(1);
+                }
             }
         }
     }

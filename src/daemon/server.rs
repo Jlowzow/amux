@@ -138,6 +138,12 @@ async fn handle_connection(
                     .await;
                 }
             }
+            ClientMessage::HasSession { name } => {
+                let reg = registry.lock().await;
+                let exists = reg.get(&name).is_some();
+                let _ =
+                    write_frame_async(&mut writer, &DaemonMessage::SessionExists(exists)).await;
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,

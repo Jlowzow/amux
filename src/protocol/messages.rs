@@ -28,6 +28,9 @@ pub enum ClientMessage {
         name: String,
         text: String,
     },
+    HasSession {
+        name: String,
+    },
 }
 
 /// Responses from daemon to client.
@@ -44,6 +47,8 @@ pub enum DaemonMessage {
     Output(Vec<u8>),
     /// Session ended while attached.
     SessionEnded,
+    /// Whether a session exists.
+    SessionExists(bool),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
