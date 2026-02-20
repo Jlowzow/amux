@@ -66,6 +66,15 @@ enum Command {
         #[arg(short = 't', long = "target")]
         name: String,
     },
+    /// Capture scrollback from a session
+    Capture {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+        /// Number of lines to dump
+        #[arg(short, long, default_value = "50")]
+        lines: usize,
+    },
     /// Start the daemon server
     StartServer,
     /// Stop daemon (use --force to kill sessions first)
@@ -239,6 +248,20 @@ fn main() -> anyhow::Result<()> {
                 _ => {
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::Capture { name, lines } => {
+            let resp = client::request(&ClientMessage::CaptureScrollback {
+                name: name.clone(),
+                lines,
+            })?;
+            match resp {
+                DaemonMessage::CaptureOutput(data) => {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&data)?;
+                }
+                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
     }

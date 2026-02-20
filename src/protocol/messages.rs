@@ -32,6 +32,10 @@ pub enum ClientMessage {
     HasSession {
         name: String,
     },
+    CaptureScrollback {
+        name: String,
+        lines: usize,
+    },
 }
 
 /// Responses from daemon to client.
@@ -54,6 +58,8 @@ pub enum DaemonMessage {
     KilledSessions {
         count: usize,
     },
+    /// Captured scrollback output.
+    CaptureOutput(Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

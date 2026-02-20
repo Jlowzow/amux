@@ -153,6 +153,24 @@ async fn handle_connection(
                 let _ =
                     write_frame_async(&mut writer, &DaemonMessage::SessionExists(exists)).await;
             }
+            ClientMessage::CaptureScrollback { name, lines } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let data = session
+                        .scrollback
+                        .lock()
+                        .map(|sb| sb.last_lines(lines))
+                        .unwrap_or_default();
+                    let _ =
+                        write_frame_async(&mut writer, &DaemonMessage::CaptureOutput(data)).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,

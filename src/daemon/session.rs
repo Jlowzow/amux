@@ -47,6 +47,41 @@ impl Scrollback {
     pub fn contents(&self) -> Vec<u8> {
         self.buf.iter().copied().collect()
     }
+
+    /// Return the last `n` lines from the scrollback buffer.
+    /// Lines are delimited by `\n`. If fewer than `n` lines exist,
+    /// returns the entire buffer contents.
+    pub fn last_lines(&self, n: usize) -> Vec<u8> {
+        if n == 0 || self.buf.is_empty() {
+            return Vec::new();
+        }
+
+        // Walk backwards counting newlines.
+        // We want n lines, which means we need to find the (n)th '\n' from the end
+        // (skipping a trailing newline if present).
+        let len = self.buf.len();
+        let mut newline_count = 0;
+        let mut start = 0;
+
+        // If buffer ends with '\n', skip it so we don't count an empty trailing line.
+        let search_end = if self.buf[len - 1] == b'\n' {
+            len - 1
+        } else {
+            len
+        };
+
+        for i in (0..search_end).rev() {
+            if self.buf[i] == b'\n' {
+                newline_count += 1;
+                if newline_count == n {
+                    start = i + 1;
+                    break;
+                }
+            }
+        }
+
+        self.buf.range(start..).copied().collect()
+    }
 }
 
 impl Session {
@@ -324,5 +359,54 @@ mod tests {
         sb.push(&data);
         assert_eq!(sb.contents().len(), SCROLLBACK_SIZE);
         assert!(sb.contents().iter().all(|&b| b == b'B'));
+    }
+
+    #[test]
+    fn test_last_lines_basic() {
+        let mut sb = Scrollback::new();
+        sb.push(b"line1\nline2\nline3\n");
+        assert_eq!(sb.last_lines(2), b"line2\nline3\n");
+    }
+
+    #[test]
+    fn test_last_lines_no_trailing_newline() {
+        let mut sb = Scrollback::new();
+        sb.push(b"line1\nline2\nline3");
+        assert_eq!(sb.last_lines(2), b"line2\nline3");
+    }
+
+    #[test]
+    fn test_last_lines_more_than_available() {
+        let mut sb = Scrollback::new();
+        sb.push(b"line1\nline2\n");
+        // Asking for more lines than exist returns everything.
+        assert_eq!(sb.last_lines(10), b"line1\nline2\n");
+    }
+
+    #[test]
+    fn test_last_lines_zero() {
+        let mut sb = Scrollback::new();
+        sb.push(b"line1\nline2\n");
+        assert!(sb.last_lines(0).is_empty());
+    }
+
+    #[test]
+    fn test_last_lines_empty_buffer() {
+        let sb = Scrollback::new();
+        assert!(sb.last_lines(5).is_empty());
+    }
+
+    #[test]
+    fn test_last_lines_single_line() {
+        let mut sb = Scrollback::new();
+        sb.push(b"only line\n");
+        assert_eq!(sb.last_lines(1), b"only line\n");
+    }
+
+    #[test]
+    fn test_last_lines_all() {
+        let mut sb = Scrollback::new();
+        sb.push(b"a\nb\nc\n");
+        assert_eq!(sb.last_lines(3), b"a\nb\nc\n");
     }
 }
