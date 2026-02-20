@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Requests from client to daemon.
@@ -8,6 +10,7 @@ pub enum ClientMessage {
     CreateSession {
         name: Option<String>,
         command: Vec<String>,
+        env: Option<HashMap<String, String>>,
     },
     ListSessions,
     KillSession {

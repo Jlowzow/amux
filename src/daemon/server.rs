@@ -79,9 +79,9 @@ async fn handle_connection(
                 let _ = shutdown.send(());
                 return;
             }
-            ClientMessage::CreateSession { name, command } => {
+            ClientMessage::CreateSession { name, command, env } => {
                 let mut reg = registry.lock().await;
-                match reg.create(name, &command, 80, 24) {
+                match reg.create(name, &command, 80, 24, env) {
                     Ok(name) => {
                         let _ = write_frame_async(
                             &mut writer,

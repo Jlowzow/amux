@@ -91,6 +91,7 @@ impl Session {
         cmd: &[String],
         cols: u16,
         rows: u16,
+        env: Option<std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<Self> {
         let winsize = Winsize {
             ws_row: if rows > 0 { rows } else { 24 },
@@ -132,7 +133,12 @@ impl Session {
                 // Exec the command.
                 let program = &cmd[0];
                 let args = &cmd[1..];
-                let err = StdCommand::new(program).args(args).exec();
+                let mut command = StdCommand::new(program);
+                command.args(args);
+                if let Some(ref env_vars) = env {
+                    command.envs(env_vars);
+                }
+                let err = command.exec();
                 eprintln!("amux: exec failed: {}", err);
                 std::process::exit(1);
             }

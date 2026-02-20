@@ -24,6 +24,9 @@ enum Command {
         /// Start detached (don't attach after creation)
         #[arg(short, long)]
         detached: bool,
+        /// Set environment variable (KEY=VALUE), can be specified multiple times
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -144,13 +147,16 @@ fn main() -> anyhow::Result<()> {
         Command::New {
             name,
             detached,
+            env,
             cmd,
         } => {
             ensure_daemon_running()?;
+            let env_map = parse_env_vars(&env)?;
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
                     name,
                     command: cmd,
+                    env: env_map,
                 })?;
                 match resp {
                     DaemonMessage::SessionCreated { name } => {
@@ -167,6 +173,7 @@ fn main() -> anyhow::Result<()> {
                 let resp = client::request(&ClientMessage::CreateSession {
                     name: name.clone(),
                     command: cmd,
+                    env: env_map,
                 })?;
                 let session_name = match resp {
                     DaemonMessage::SessionCreated { name } => name,
@@ -337,3 +344,23 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use anyhow::Context;
+
+/// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
+fn parse_env_vars(
+    vars: &[String],
+) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
+    if vars.is_empty() {
+        return Ok(None);
+    }
+    let mut map = std::collections::HashMap::new();
+    for var in vars {
+        let (key, value) = var
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid env var '{}': expected KEY=VALUE", var))?;
+        if key.is_empty() {
+            anyhow::bail!("invalid env var '{}': key cannot be empty", var);
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(Some(map))
+}
