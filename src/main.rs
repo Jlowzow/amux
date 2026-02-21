@@ -140,6 +140,14 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Auto-start daemon for commands that need it (all except start-server and kill-server)
+    if !matches!(
+        &command,
+        Command::StartServer | Command::KillServer { .. }
+    ) {
+        ensure_daemon_running()?;
+    }
+
     match command {
         Command::StartServer => {
             if common::server_running() {
@@ -149,6 +157,10 @@ fn main() -> anyhow::Result<()> {
             daemon::fork_daemon()?;
         }
         Command::KillServer { force } => {
+            if !common::server_running() {
+                eprintln!("amux: server is not running");
+                return Ok(());
+            }
             if force {
                 // Kill all sessions first, then stop the server.
                 let resp = client::request(&ClientMessage::KillAllSessions)?;
@@ -197,7 +209,6 @@ fn main() -> anyhow::Result<()> {
             env,
             cmd,
         } => {
-            ensure_daemon_running()?;
             let env_map = parse_env_vars(&env)?;
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
