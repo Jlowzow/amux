@@ -243,9 +243,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Attach { name } => {
+            ensure_daemon_running()?;
             do_attach(&name)?;
         }
         Command::Ls { json } => {
+            ensure_daemon_running()?;
             let resp = client::request(&ClientMessage::ListSessions)?;
             match resp {
                 DaemonMessage::SessionList(sessions) => {
@@ -274,6 +276,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Kill { name, all } => {
+            ensure_daemon_running()?;
             if all {
                 do_kill_all()?;
             } else {
@@ -291,6 +294,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::KillAll => {
+            ensure_daemon_running()?;
             do_kill_all()?;
         }
         Command::Send {
@@ -298,6 +302,7 @@ fn main() -> anyhow::Result<()> {
             literal,
             text,
         } => {
+            ensure_daemon_running()?;
             let joined = text.join(" ");
             let resp = client::request(&ClientMessage::SendInput {
                 name: name.clone(),
@@ -314,6 +319,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Has { name } => {
+            ensure_daemon_running()?;
             let resp = client::request(&ClientMessage::HasSession { name });
             match resp {
                 Ok(DaemonMessage::SessionExists(true)) => {
@@ -325,6 +331,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Capture { name, lines, plain } => {
+            ensure_daemon_running()?;
             let resp = client::request(&ClientMessage::CaptureScrollback {
                 name: name.clone(),
                 lines,
@@ -342,7 +349,9 @@ fn main() -> anyhow::Result<()> {
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
-        Command::Env { action } => match action {
+        Command::Env { action } => {
+            ensure_daemon_running()?;
+            match action {
             EnvAction::Set { name, key, value } => {
                 let resp = client::request(&ClientMessage::SetEnv {
                     name: name.clone(),
@@ -394,7 +403,7 @@ fn main() -> anyhow::Result<()> {
                     other => eprintln!("amux: unexpected: {:?}", other),
                 }
             }
-        },
+        }},
     }
 
     Ok(())

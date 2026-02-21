@@ -201,7 +201,7 @@ impl Session {
             resize_tx,
             kill_tx: Some(kill_tx),
             scrollback,
-            env_vars: HashMap::new(),
+            env_vars: env.unwrap_or_default(),
         };
 
         Ok(session)
