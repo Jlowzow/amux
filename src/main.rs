@@ -201,6 +201,9 @@ fn main() -> anyhow::Result<()> {
             cmd,
         } => {
             ensure_daemon_running()?;
+            if let Some(ref n) = name {
+                daemon::registry::validate_session_name(n)?;
+            }
             let env_map = parse_env_vars(&env)?;
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {

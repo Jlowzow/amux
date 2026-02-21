@@ -40,6 +40,9 @@ impl Registry {
         rows: u16,
         env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<String> {
+        if let Some(ref n) = name {
+            validate_session_name(n)?;
+        }
         let name = self.allocate_name(name);
         if self.sessions.contains_key(&name) {
             anyhow::bail!("session '{}' already exists", name);
@@ -123,6 +126,25 @@ impl Registry {
     }
 }
 
+/// Validate a user-provided session name.
+///
+/// Names must be non-empty and contain only `[a-zA-Z0-9_-]`.
+pub fn validate_session_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("session name cannot be empty");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!(
+            "invalid session name '{}': only [a-zA-Z0-9_-] allowed",
+            name
+        );
+    }
+    Ok(())
+}
+
 /// Format a SystemTime as an ISO 8601 UTC string (no external deps).
 fn format_system_time(t: std::time::SystemTime) -> String {
     let dur = t
@@ -188,5 +210,39 @@ mod tests {
         assert!(s.starts_with("20"));
         assert!(s.ends_with('Z'));
         assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn test_validate_session_name_valid() {
+        assert!(validate_session_name("my-session").is_ok());
+        assert!(validate_session_name("session_1").is_ok());
+        assert!(validate_session_name("ABC123").is_ok());
+        assert!(validate_session_name("a").is_ok());
+        assert!(validate_session_name("test-session_2").is_ok());
+    }
+
+    #[test]
+    fn test_validate_session_name_empty() {
+        let err = validate_session_name("").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_session_name_slash() {
+        let err = validate_session_name("foo/bar").unwrap_err();
+        assert!(err.to_string().contains("only [a-zA-Z0-9_-] allowed"));
+    }
+
+    #[test]
+    fn test_validate_session_name_space() {
+        let err = validate_session_name("foo bar").unwrap_err();
+        assert!(err.to_string().contains("only [a-zA-Z0-9_-] allowed"));
+    }
+
+    #[test]
+    fn test_validate_session_name_special_chars() {
+        assert!(validate_session_name("foo.bar").is_err());
+        assert!(validate_session_name("foo@bar").is_err());
+        assert!(validate_session_name("../etc").is_err());
     }
 }
