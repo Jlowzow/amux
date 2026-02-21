@@ -17,16 +17,37 @@ impl Registry {
         }
     }
 
-    /// Allocate a session name if none provided.
-    pub fn allocate_name(&self, requested: Option<String>) -> String {
+    /// Validate a session name: must be non-empty and contain only [a-zA-Z0-9_-].
+    fn validate_name(name: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            anyhow::bail!("session name must not be empty");
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "invalid session name '{}': only [a-zA-Z0-9_-] allowed",
+                name
+            );
+        }
+        Ok(())
+    }
+
+    /// Allocate a session name if none provided, and validate it.
+    pub fn allocate_name(&self, requested: Option<String>) -> anyhow::Result<String> {
         if let Some(name) = requested {
-            return name;
+            Self::validate_name(&name)?;
+            if self.sessions.contains_key(&name) {
+                anyhow::bail!("session '{}' already exists", name);
+            }
+            return Ok(name);
         }
         loop {
             let n = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
             let name = n.to_string();
             if !self.sessions.contains_key(&name) {
-                return name;
+                return Ok(name);
             }
         }
     }
@@ -40,10 +61,7 @@ impl Registry {
         rows: u16,
         env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<String> {
-        let name = self.allocate_name(name);
-        if self.sessions.contains_key(&name) {
-            anyhow::bail!("session '{}' already exists", name);
-        }
+        let name = self.allocate_name(name)?;
         let session = Session::spawn(name.clone(), cmd, cols, rows, env)?;
         self.sessions.insert(name.clone(), session);
         Ok(name)

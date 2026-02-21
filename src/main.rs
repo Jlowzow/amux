@@ -183,7 +183,10 @@ fn main() -> anyhow::Result<()> {
             let resp = client::request(&ClientMessage::KillServer)?;
             match resp {
                 DaemonMessage::Ok => eprintln!("amux: server stopped"),
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected response: {:?}", other),
             }
         }
@@ -263,7 +266,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
@@ -276,7 +282,10 @@ fn main() -> anyhow::Result<()> {
                     client::request(&ClientMessage::KillSession { name: name.clone() })?;
                 match resp {
                     DaemonMessage::Ok => eprintln!("amux: killed session '{}'", name),
-                    DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
                     other => eprintln!("amux: unexpected: {:?}", other),
                 }
             }
@@ -297,7 +306,10 @@ fn main() -> anyhow::Result<()> {
             })?;
             match resp {
                 DaemonMessage::InputSent => {}
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
@@ -323,7 +335,10 @@ fn main() -> anyhow::Result<()> {
                     let output = if plain { strip_ansi(&data) } else { data };
                     std::io::stdout().write_all(&output)?;
                 }
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
@@ -417,6 +432,15 @@ fn ensure_daemon_running() -> anyhow::Result<()> {
 /// Attach to a named session.
 fn do_attach(name: &str) -> anyhow::Result<()> {
     use crate::protocol::codec::write_frame;
+
+    // Pre-check: verify session exists before attempting PTY attach.
+    let resp = client::request(&ClientMessage::HasSession {
+        name: name.to_string(),
+    })?;
+    if !matches!(resp, DaemonMessage::SessionExists(true)) {
+        eprintln!("amux: session '{}' not found", name);
+        std::process::exit(1);
+    }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 

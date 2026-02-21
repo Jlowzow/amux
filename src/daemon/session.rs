@@ -106,9 +106,18 @@ impl Session {
         let pty = openpty(Some(&winsize), None)?;
         let slave_fd = pty.slave.as_raw_fd();
 
-        // Set slave to raw mode equivalent (disable echo/canon for agents).
+        // Start from raw mode (disables canonical processing, signals, etc.)
+        // but re-enable ECHO so that input written to the master side is
+        // echoed back through the slave's output — matching normal terminal
+        // behaviour where typed commands are visible.
         let mut termios_settings = termios::tcgetattr(&pty.slave)?;
         termios::cfmakeraw(&mut termios_settings);
+        termios_settings.local_flags.insert(
+            termios::LocalFlags::ECHO
+                | termios::LocalFlags::ECHOE
+                | termios::LocalFlags::ECHOK
+                | termios::LocalFlags::ECHOCTL,
+        );
         termios::tcsetattr(&pty.slave, termios::SetArg::TCSANOW, &termios_settings)?;
 
         // Fork child process.
