@@ -80,6 +80,9 @@ enum Command {
         /// Number of lines to dump
         #[arg(short, long, default_value = "50")]
         lines: usize,
+        /// Strip ANSI escape sequences from output
+        #[arg(long)]
+        plain: bool,
     },
     /// Get or set session-level environment variables
     Env {
@@ -309,7 +312,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Capture { name, lines } => {
+        Command::Capture { name, lines, plain } => {
             let resp = client::request(&ClientMessage::CaptureScrollback {
                 name: name.clone(),
                 lines,
@@ -317,7 +320,8 @@ fn main() -> anyhow::Result<()> {
             match resp {
                 DaemonMessage::CaptureOutput(data) => {
                     use std::io::Write;
-                    std::io::stdout().write_all(&data)?;
+                    let output = if plain { strip_ansi(&data) } else { data };
+                    std::io::stdout().write_all(&output)?;
                 }
                 DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
                 other => eprintln!("amux: unexpected: {:?}", other),
@@ -450,6 +454,65 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use anyhow::Context;
 
+/// Strip ANSI escape sequences from raw bytes.
+///
+/// Handles CSI sequences (colors, cursor movement), OSC sequences (terminal title),
+/// and other Fe escape sequences commonly found in terminal output.
+fn strip_ansi(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b {
+            i += 1;
+            if i >= input.len() {
+                break;
+            }
+            match input[i] {
+                b'[' => {
+                    // CSI sequence: ESC [ (parameter bytes 0x30-0x3F)* (intermediate bytes 0x20-0x2F)* (final byte 0x40-0x7E)
+                    i += 1;
+                    while i < input.len() && (0x30..=0x3F).contains(&input[i]) {
+                        i += 1;
+                    }
+                    while i < input.len() && (0x20..=0x2F).contains(&input[i]) {
+                        i += 1;
+                    }
+                    if i < input.len() && (0x40..=0x7E).contains(&input[i]) {
+                        i += 1;
+                    }
+                }
+                b']' => {
+                    // OSC sequence: ESC ] ... (terminated by BEL or ST)
+                    i += 1;
+                    while i < input.len() {
+                        if input[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                0x40..=0x5F => {
+                    // Other Fe escape sequences (ESC followed by 0x40-0x5F)
+                    // Already handled '[' (0x5B) and ']' (0x5D) above
+                    i += 1;
+                }
+                _ => {
+                    // Unknown sequence after ESC, skip just the ESC
+                }
+            }
+        } else {
+            output.push(input[i]);
+            i += 1;
+        }
+    }
+    output
+}
+
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
 fn parse_env_vars(
     vars: &[String],
@@ -468,4 +531,72 @@ fn parse_env_vars(
         map.insert(key.to_string(), value.to_string());
     }
     Ok(Some(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn test_strip_ansi_plain_text() {
+        let input = b"hello world";
+        assert_eq!(strip_ansi(input), b"hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty() {
+        assert_eq!(strip_ansi(b""), b"");
+    }
+
+    #[test]
+    fn test_strip_ansi_sgr_colors() {
+        // ESC[31m = red, ESC[0m = reset
+        let input = b"\x1b[31mhello\x1b[0m world";
+        assert_eq!(strip_ansi(input), b"hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_cursor_movement() {
+        // ESC[2J = clear screen, ESC[H = cursor home
+        let input = b"\x1b[2J\x1b[Hprompt$ ";
+        assert_eq!(strip_ansi(input), b"prompt$ ");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_bel_terminated() {
+        // OSC: ESC ] 0;title BEL
+        let input = b"\x1b]0;my terminal\x07prompt$ ";
+        assert_eq!(strip_ansi(input), b"prompt$ ");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_st_terminated() {
+        // OSC: ESC ] 0;title ESC backslash
+        let input = b"\x1b]0;my terminal\x1b\\prompt$ ";
+        assert_eq!(strip_ansi(input), b"prompt$ ");
+    }
+
+    #[test]
+    fn test_strip_ansi_complex_csi() {
+        // ESC[?2004h = bracketed paste mode, ESC[1;32m = bold green
+        let input = b"\x1b[?2004h\x1b[1;32muser@host\x1b[0m:~$ ";
+        assert_eq!(strip_ansi(input), b"user@host:~$ ");
+    }
+
+    #[test]
+    fn test_strip_ansi_preserves_newlines() {
+        let input = b"\x1b[32mline1\x1b[0m\nline2\n";
+        assert_eq!(strip_ansi(input), b"line1\nline2\n");
+    }
+
+    #[test]
+    fn test_strip_ansi_mixed_content() {
+        // Simulates typical zsh prompt output with colors and cursor codes
+        let input = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m \r \r\x1b[0m\x1b[27m\x1b[24m$ echo ALIVE\r\nALIVE\r\n";
+        let result = strip_ansi(input);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("ALIVE"));
+        // Should not contain any ESC characters
+        assert!(!result.contains(&0x1b));
+    }
 }
