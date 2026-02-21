@@ -241,8 +241,8 @@ async fn handle_connection(
                 }
             }
             ClientMessage::WaitSession { name, timeout_secs } => {
-                // Subscribe to session's output to detect when it closes.
-                let mut output_rx = {
+                // Subscribe to session's exit watch to detect when io_loop exits.
+                let mut exit_rx = {
                     let reg = registry.lock().await;
                     match reg.get(&name) {
                         Some(session) => {
@@ -255,7 +255,7 @@ async fn handle_connection(
                                 .await;
                                 continue;
                             }
-                            session.output_tx.subscribe()
+                            session.exit_watch.clone()
                         }
                         None => {
                             let _ = write_frame_async(
@@ -268,13 +268,14 @@ async fn handle_connection(
                     }
                 };
 
-                // Wait for output channel to close (session ended) or timeout.
+                // Wait for exit_watch to signal true (io_loop exited) or timeout.
                 let wait_fut = async {
                     loop {
-                        match output_rx.recv().await {
-                            Ok(_) => continue, // Discard output, just wait.
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        if exit_rx.changed().await.is_err() {
+                            break; // Sender dropped (session cleaned up).
+                        }
+                        if *exit_rx.borrow() {
+                            break; // io_loop signalled exit.
                         }
                     }
                 };

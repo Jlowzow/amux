@@ -8,7 +8,7 @@ use nix::libc;
 use nix::pty::{openpty, Winsize};
 use nix::sys::termios;
 use nix::unistd::{self, ForkResult};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const SCROLLBACK_SIZE: usize = 64 * 1024; // 64KB
 
@@ -24,6 +24,8 @@ pub struct Session {
     pub resize_tx: mpsc::Sender<(u16, u16)>,
     pub kill_tx: Option<oneshot::Sender<()>>,
     pub scrollback: Arc<StdMutex<Scrollback>>,
+    /// Receiver that yields `true` when the session's io_loop exits.
+    pub exit_watch: watch::Receiver<bool>,
     /// Session-level metadata environment variables (not process env).
     pub env_vars: HashMap<String, String>,
 }
@@ -176,6 +178,7 @@ impl Session {
         let (output_tx, _) = broadcast::channel::<Vec<u8>>(256);
         let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>(16);
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
+        let (exit_tx, exit_rx) = watch::channel(false);
 
         let output_tx_clone = output_tx.clone();
         let command_str = cmd.join(" ");
@@ -195,6 +198,7 @@ impl Session {
             last_activity_clone,
             resize_rx,
             kill_rx,
+            exit_tx,
         ));
 
         let session = Session {
@@ -208,6 +212,7 @@ impl Session {
             resize_tx,
             kill_tx: Some(kill_tx),
             scrollback,
+            exit_watch: exit_rx,
             env_vars: env.unwrap_or_default(),
         };
 
@@ -223,6 +228,7 @@ impl Session {
         last_activity: Arc<StdMutex<std::time::SystemTime>>,
         mut resize_rx: mpsc::Receiver<(u16, u16)>,
         mut kill_rx: oneshot::Receiver<()>,
+        exit_tx: watch::Sender<bool>,
     ) {
         // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
@@ -328,6 +334,9 @@ impl Session {
                 }
             }
         }
+
+        // Signal that the io_loop has exited (session is effectively dead).
+        let _ = exit_tx.send(true);
 
         // Wait for child to exit.
         let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
