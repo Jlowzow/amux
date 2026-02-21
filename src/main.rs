@@ -276,7 +276,10 @@ fn main() -> anyhow::Result<()> {
                     client::request(&ClientMessage::KillSession { name: name.clone() })?;
                 match resp {
                     DaemonMessage::Ok => eprintln!("amux: killed session '{}'", name),
-                    DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
                     other => eprintln!("amux: unexpected: {:?}", other),
                 }
             }
@@ -297,7 +300,10 @@ fn main() -> anyhow::Result<()> {
             })?;
             match resp {
                 DaemonMessage::InputSent => {}
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
@@ -323,7 +329,10 @@ fn main() -> anyhow::Result<()> {
                     let output = if plain { strip_ansi(&data) } else { data };
                     std::io::stdout().write_all(&output)?;
                 }
-                DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
