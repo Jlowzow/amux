@@ -16,3 +16,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+strip-ansi-escapes = "0.2"

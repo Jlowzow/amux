@@ -80,6 +80,9 @@ enum Command {
         /// Number of lines to dump
         #[arg(short, long, default_value = "50")]
         lines: usize,
+        /// Strip ANSI escape codes from output
+        #[arg(long)]
+        plain: bool,
     },
     /// Get or set session-level environment variables
     Env {
@@ -309,7 +312,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Capture { name, lines } => {
+        Command::Capture { name, lines, plain } => {
             let resp = client::request(&ClientMessage::CaptureScrollback {
                 name: name.clone(),
                 lines,
@@ -317,7 +320,12 @@ fn main() -> anyhow::Result<()> {
             match resp {
                 DaemonMessage::CaptureOutput(data) => {
                     use std::io::Write;
-                    std::io::stdout().write_all(&data)?;
+                    let output = if plain {
+                        strip_ansi_escapes::strip(&data)
+                    } else {
+                        data
+                    };
+                    std::io::stdout().write_all(&output)?;
                 }
                 DaemonMessage::Error(e) => eprintln!("amux: error: {}", e),
                 other => eprintln!("amux: unexpected: {:?}", other),
