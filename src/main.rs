@@ -469,3 +469,30 @@ fn parse_env_vars(
     }
     Ok(Some(map))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_env_vars_multiple() {
+        let vars = vec!["FOO=1".to_string(), "BAR=2".to_string()];
+        let result = parse_env_vars(&vars).unwrap().unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("FOO"), Some(&"1".to_string()));
+        assert_eq!(result.get("BAR"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_vars_empty() {
+        let vars: Vec<String> = vec![];
+        assert!(parse_env_vars(&vars).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_env_vars_value_with_equals() {
+        let vars = vec!["KEY=val=ue".to_string()];
+        let result = parse_env_vars(&vars).unwrap().unwrap();
+        assert_eq!(result.get("KEY"), Some(&"val=ue".to_string()));
+    }
+}
