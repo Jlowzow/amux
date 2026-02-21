@@ -140,6 +140,12 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Auto-start daemon for client commands (like tmux does).
+    let needs_daemon = !matches!(command, Command::StartServer | Command::KillServer { .. });
+    if needs_daemon {
+        ensure_daemon_running()?;
+    }
+
     match command {
         Command::StartServer => {
             if common::server_running() {
@@ -197,7 +203,6 @@ fn main() -> anyhow::Result<()> {
             env,
             cmd,
         } => {
-            ensure_daemon_running()?;
             let env_map = parse_env_vars(&env)?;
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
@@ -399,15 +404,21 @@ fn do_kill_all() -> anyhow::Result<()> {
 
 /// Ensure the daemon is running, starting it if needed.
 fn ensure_daemon_running() -> anyhow::Result<()> {
-    if !common::server_running() {
-        daemon::fork_daemon()?;
-        // Wait briefly for the daemon to start.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if !common::server_running() {
-            anyhow::bail!("failed to start daemon");
+    if common::server_running() {
+        return Ok(());
+    }
+    daemon::fork_daemon()?;
+    // Poll for the socket to become available.
+    for i in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if common::server_running() {
+            return Ok(());
+        }
+        if i == 9 {
+            eprintln!("amux: waiting for server to start...");
         }
     }
-    Ok(())
+    anyhow::bail!("failed to start daemon (socket not available after 1s)");
 }
 
 /// Attach to a named session.
@@ -417,7 +428,7 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
     let mut stream =
-        client::connect().context("is the server running?")?;
+        client::connect().context("failed to connect to server")?;
 
     // Send Attach message.
     write_frame(

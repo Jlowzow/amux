@@ -17,7 +17,7 @@ pub fn connect() -> anyhow::Result<UnixStream> {
 
 /// Send a request and read the response (sync, for simple commands).
 pub fn request(req: &ClientMessage) -> anyhow::Result<DaemonMessage> {
-    let mut stream = connect().context("is the server running? try: amux start-server")?;
+    let mut stream = connect().context("failed to connect to server")?;
     write_frame(&mut stream, req)?;
     let resp: DaemonMessage = read_frame(&mut stream)?;
     Ok(resp)
