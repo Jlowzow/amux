@@ -189,4 +189,39 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert_eq!(s.len(), 20);
     }
+
+    #[tokio::test]
+    async fn test_create_duplicate_session_rejected() {
+        let mut reg = Registry::new();
+        let cmd = vec!["sleep".to_string(), "999".to_string()];
+        let name1 = reg.create(Some("test1".into()), &cmd, 80, 24, None);
+        assert!(name1.is_ok(), "first create should succeed");
+        assert_eq!(name1.unwrap(), "test1");
+
+        let name2 = reg.create(Some("test1".into()), &cmd, 80, 24, None);
+        assert!(name2.is_err(), "duplicate create should fail");
+        let err_msg = name2.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already exists"),
+            "error should mention 'already exists', got: {}",
+            err_msg
+        );
+
+        // Clean up spawned session.
+        let _ = reg.kill("test1");
+    }
+
+    #[test]
+    fn test_allocate_name_returns_requested() {
+        let reg = Registry::new();
+        assert_eq!(reg.allocate_name(Some("foo".into())), "foo");
+    }
+
+    #[test]
+    fn test_allocate_name_auto_generates() {
+        let reg = Registry::new();
+        let name = reg.allocate_name(None);
+        // Auto-generated names are numeric strings.
+        assert!(name.parse::<u64>().is_ok());
+    }
 }
