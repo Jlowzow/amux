@@ -25,7 +25,7 @@ enum Command {
         #[arg(short, long)]
         detached: bool,
         /// Set environment variable (KEY=VALUE), can be specified multiple times
-        #[arg(short = 'e', long = "env")]
+        #[arg(short = 'e', long = "env", action = clap::ArgAction::Append)]
         env: Vec<String>,
         /// Command to run
         #[arg(last = true, required = true)]
@@ -468,4 +468,82 @@ fn parse_env_vars(
         map.insert(key.to_string(), value.to_string());
     }
     Ok(Some(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_parse_env_vars_multiple() {
+        let vars = vec![
+            "GT_ROLE=witness".to_string(),
+            "GT_RIG=amux".to_string(),
+        ];
+        let result = parse_env_vars(&vars).unwrap().unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("GT_ROLE"), Some(&"witness".to_string()));
+        assert_eq!(result.get("GT_RIG"), Some(&"amux".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_vars_empty() {
+        let vars: Vec<String> = vec![];
+        let result = parse_env_vars(&vars).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cli_multiple_env_flags() {
+        let cli = Cli::try_parse_from(&[
+            "amux", "new", "-t", "name", "-d",
+            "-e", "GT_ROLE=witness", "-e", "GT_RIG=amux",
+            "--", "/bin/zsh",
+        ]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::New { env, name, detached, cmd } => {
+                assert_eq!(name, Some("name".to_string()));
+                assert!(detached);
+                assert_eq!(env.len(), 2, "Expected 2 env vars, got {}: {:?}", env.len(), env);
+                assert_eq!(env[0], "GT_ROLE=witness");
+                assert_eq!(env[1], "GT_RIG=amux");
+                assert_eq!(cmd, vec!["/bin/zsh"]);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_single_env_flag() {
+        let cli = Cli::try_parse_from(&[
+            "amux", "new",
+            "-e", "GT_ROLE=witness",
+            "--", "/bin/zsh",
+        ]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::New { env, .. } => {
+                assert_eq!(env.len(), 1);
+                assert_eq!(env[0], "GT_ROLE=witness");
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_no_env_flags() {
+        let cli = Cli::try_parse_from(&[
+            "amux", "new",
+            "--", "/bin/zsh",
+        ]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::New { env, .. } => {
+                assert!(env.is_empty());
+            }
+            _ => panic!("expected New command"),
+        }
+    }
 }
