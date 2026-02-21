@@ -67,27 +67,48 @@ impl Registry {
         Ok(name)
     }
 
+    /// Build a SessionInfo from a Session.
+    fn session_info(s: &Session, now: std::time::SystemTime) -> SessionInfo {
+        let uptime_secs = now
+            .duration_since(s.created_at)
+            .unwrap_or_default()
+            .as_secs();
+        let created_at = format_system_time(s.created_at);
+        let last_activity_time = s
+            .last_activity
+            .lock()
+            .map(|ts| *ts)
+            .unwrap_or(s.created_at);
+        let idle_secs = now
+            .duration_since(last_activity_time)
+            .unwrap_or_default()
+            .as_secs();
+        let last_activity = format_system_time(last_activity_time);
+        SessionInfo {
+            name: s.name.clone(),
+            command: s.command.clone(),
+            pid: s.child_pid.as_raw() as u32,
+            alive: s.is_alive(),
+            created_at,
+            uptime_secs,
+            last_activity,
+            idle_secs,
+        }
+    }
+
     /// List all sessions.
     pub fn list(&self) -> Vec<SessionInfo> {
         let now = std::time::SystemTime::now();
         self.sessions
             .values()
-            .map(|s| {
-                let uptime_secs = now
-                    .duration_since(s.created_at)
-                    .unwrap_or_default()
-                    .as_secs();
-                let created_at = format_system_time(s.created_at);
-                SessionInfo {
-                    name: s.name.clone(),
-                    command: s.command.clone(),
-                    pid: s.child_pid.as_raw() as u32,
-                    alive: s.is_alive(),
-                    created_at,
-                    uptime_secs,
-                }
-            })
+            .map(|s| Self::session_info(s, now))
             .collect()
+    }
+
+    /// Get detailed info for a single session.
+    pub fn info(&self, name: &str) -> Option<SessionInfo> {
+        let now = std::time::SystemTime::now();
+        self.sessions.get(name).map(|s| Self::session_info(s, now))
     }
 
     /// Kill a session by name.

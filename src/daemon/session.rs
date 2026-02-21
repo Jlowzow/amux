@@ -17,6 +17,8 @@ pub struct Session {
     pub command: String,
     pub child_pid: nix::unistd::Pid,
     pub created_at: std::time::SystemTime,
+    /// Timestamp of last PTY output (updated by io_loop).
+    pub last_activity: Arc<StdMutex<std::time::SystemTime>>,
     pub input_tx: mpsc::Sender<Vec<u8>>,
     pub output_tx: broadcast::Sender<Vec<u8>>,
     pub resize_tx: mpsc::Sender<(u16, u16)>,
@@ -179,6 +181,9 @@ impl Session {
         let command_str = cmd.join(" ");
         let scrollback = Arc::new(StdMutex::new(Scrollback::new()));
         let scrollback_clone = scrollback.clone();
+        let now = std::time::SystemTime::now();
+        let last_activity = Arc::new(StdMutex::new(now));
+        let last_activity_clone = last_activity.clone();
 
         // Spawn the I/O task (owns the master fd via OwnedFd).
         tokio::spawn(Self::io_loop(
@@ -187,6 +192,7 @@ impl Session {
             input_rx,
             output_tx_clone,
             scrollback_clone,
+            last_activity_clone,
             resize_rx,
             kill_rx,
         ));
@@ -195,7 +201,8 @@ impl Session {
             name,
             command: command_str,
             child_pid,
-            created_at: std::time::SystemTime::now(),
+            created_at: now,
+            last_activity,
             input_tx,
             output_tx,
             resize_tx,
@@ -213,6 +220,7 @@ impl Session {
         mut input_rx: mpsc::Receiver<Vec<u8>>,
         output_tx: broadcast::Sender<Vec<u8>>,
         scrollback: Arc<StdMutex<Scrollback>>,
+        last_activity: Arc<StdMutex<std::time::SystemTime>>,
         mut resize_rx: mpsc::Receiver<(u16, u16)>,
         mut kill_rx: oneshot::Receiver<()>,
     ) {
@@ -252,9 +260,12 @@ impl Session {
                                 Ok(Ok(0)) => break, // EOF
                                 Ok(Ok(n)) => {
                                     let data = read_buf[..n].to_vec();
-                                    // Store in scrollback (short critical section, no await).
+                                    // Store in scrollback and update activity timestamp.
                                     if let Ok(mut sb) = scrollback.lock() {
                                         sb.push(&data);
+                                    }
+                                    if let Ok(mut ts) = last_activity.lock() {
+                                        *ts = std::time::SystemTime::now();
                                     }
                                     let _ = output_tx.send(data);
                                 }

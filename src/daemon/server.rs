@@ -104,6 +104,25 @@ async fn handle_connection(
                 let _ =
                     write_frame_async(&mut writer, &DaemonMessage::SessionList(list)).await;
             }
+            ClientMessage::GetSessionInfo { name } => {
+                let reg = registry.lock().await;
+                match reg.info(&name) {
+                    Some(info) => {
+                        let _ = write_frame_async(
+                            &mut writer,
+                            &DaemonMessage::SessionDetail(info),
+                        )
+                        .await;
+                    }
+                    None => {
+                        let _ = write_frame_async(
+                            &mut writer,
+                            &DaemonMessage::Error(format!("session '{}' not found", name)),
+                        )
+                        .await;
+                    }
+                }
+            }
             ClientMessage::KillSession { name } => {
                 let mut reg = registry.lock().await;
                 match reg.kill(&name) {
@@ -217,6 +236,76 @@ async fn handle_connection(
                     let _ = write_frame_async(
                         &mut writer,
                         &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
+            ClientMessage::WaitSession { name, timeout_secs } => {
+                // Subscribe to session's output to detect when it closes.
+                let mut output_rx = {
+                    let reg = registry.lock().await;
+                    match reg.get(&name) {
+                        Some(session) => {
+                            // If already dead, return immediately.
+                            if !session.is_alive() {
+                                let _ = write_frame_async(
+                                    &mut writer,
+                                    &DaemonMessage::SessionExited,
+                                )
+                                .await;
+                                continue;
+                            }
+                            session.output_tx.subscribe()
+                        }
+                        None => {
+                            let _ = write_frame_async(
+                                &mut writer,
+                                &DaemonMessage::Error(format!("session '{}' not found", name)),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                };
+
+                // Wait for output channel to close (session ended) or timeout.
+                let wait_fut = async {
+                    loop {
+                        match output_rx.recv().await {
+                            Ok(_) => continue, // Discard output, just wait.
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
+                    }
+                };
+
+                if timeout_secs > 0 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        wait_fut,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            let _ = write_frame_async(
+                                &mut writer,
+                                &DaemonMessage::SessionExited,
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            let _ = write_frame_async(
+                                &mut writer,
+                                &DaemonMessage::Error("timeout".to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    wait_fut.await;
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::SessionExited,
                     )
                     .await;
                 }

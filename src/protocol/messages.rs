@@ -13,6 +13,10 @@ pub enum ClientMessage {
         env: Option<HashMap<String, String>>,
     },
     ListSessions,
+    /// Get detailed info for a single session.
+    GetSessionInfo {
+        name: String,
+    },
     KillSession {
         name: String,
     },
@@ -52,6 +56,12 @@ pub enum ClientMessage {
     GetAllEnv {
         name: String,
     },
+    /// Block until a session exits or a timeout elapses.
+    WaitSession {
+        name: String,
+        /// Timeout in seconds (0 = wait forever).
+        timeout_secs: u64,
+    },
 }
 
 /// Responses from daemon to client.
@@ -64,6 +74,8 @@ pub enum DaemonMessage {
         name: String,
     },
     SessionList(Vec<SessionInfo>),
+    /// Detailed info for a single session.
+    SessionDetail(SessionInfo),
     /// Output data streamed during attach.
     Output(Vec<u8>),
     /// Session ended while attached.
@@ -82,6 +94,8 @@ pub enum DaemonMessage {
     EnvValue(Option<String>),
     /// All environment variables for a session.
     EnvVars(HashMap<String, String>),
+    /// Session exited (response to WaitSession).
+    SessionExited,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,4 +108,8 @@ pub struct SessionInfo {
     pub created_at: String,
     /// Seconds since session was created.
     pub uptime_secs: u64,
+    /// ISO 8601 timestamp of last PTY output activity.
+    pub last_activity: String,
+    /// Seconds since last PTY output activity.
+    pub idle_secs: u64,
 }

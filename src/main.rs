@@ -44,6 +44,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Get detailed info for a single session
+    Info {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for a session to exit
+    Wait {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+        /// Timeout in seconds (0 = wait forever)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+    },
     /// Kill a session (or all sessions with --all)
     Kill {
         /// Target session name
@@ -263,12 +281,65 @@ fn main() -> anyhow::Result<()> {
                         for s in &sessions {
                             let status = if s.alive { "" } else { " (dead)" };
                             println!(
-                                "{}: {} (pid {}, up {}s, created {}){}", s.name, s.command, s.pid, s.uptime_secs, s.created_at, status
+                                "{}: {} (pid {}, up {}s, idle {}s, created {}){}", s.name, s.command, s.pid, s.uptime_secs, s.idle_secs, s.created_at, status
                             );
                         }
                     }
                 }
                 DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
+                other => eprintln!("amux: unexpected: {:?}", other),
+            }
+        }
+        Command::Info { name, json } => {
+            ensure_daemon_running()?;
+            let resp = client::request(&ClientMessage::GetSessionInfo {
+                name: name.clone(),
+            })?;
+            match resp {
+                DaemonMessage::SessionDetail(info) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&info)
+                                .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
+                        );
+                    } else {
+                        let status = if info.alive { "alive" } else { "dead" };
+                        println!("name: {}", info.name);
+                        println!("command: {}", info.command);
+                        println!("pid: {}", info.pid);
+                        println!("status: {}", status);
+                        println!("created: {}", info.created_at);
+                        println!("uptime: {}s", info.uptime_secs);
+                        println!("last_activity: {}", info.last_activity);
+                        println!("idle: {}s", info.idle_secs);
+                    }
+                }
+                DaemonMessage::Error(e) => {
+                    eprintln!("amux: error: {}", e);
+                    std::process::exit(1);
+                }
+                other => eprintln!("amux: unexpected: {:?}", other),
+            }
+        }
+        Command::Wait { name, timeout } => {
+            ensure_daemon_running()?;
+            let resp = client::request(&ClientMessage::WaitSession {
+                name: name.clone(),
+                timeout_secs: timeout,
+            })?;
+            match resp {
+                DaemonMessage::SessionExited => {
+                    // Session exited normally.
+                }
+                DaemonMessage::Error(e) => {
+                    if e == "timeout" {
+                        eprintln!("amux: wait timed out for session '{}'", name);
+                        std::process::exit(2);
+                    }
                     eprintln!("amux: error: {}", e);
                     std::process::exit(1);
                 }
