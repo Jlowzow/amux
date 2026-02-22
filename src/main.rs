@@ -549,8 +549,8 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
                 std::os::unix::net::UnixStream::from_raw_fd(std_stream),
             )?
         };
-        let (mut reader, mut writer) = tokio_stream.into_split();
-        client::attach::run_attach(&mut reader, &mut writer).await
+        let (reader, mut writer) = tokio_stream.into_split();
+        client::attach::run_attach(reader, &mut writer).await
     })
 }
 

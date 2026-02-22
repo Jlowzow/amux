@@ -23,7 +23,7 @@ impl AsRawFd for NonOwningFd {
 
 /// Run the attach loop: bidirectional I/O between terminal and daemon.
 pub async fn run_attach(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    reader: tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<()> {
     // Enable raw mode.
@@ -48,43 +48,92 @@ pub async fn run_attach(
     result
 }
 
+/// Messages from the daemon reader task to the attach loop.
+enum DaemonEvent {
+    /// PTY output data to display.
+    Output(Vec<u8>),
+    /// Session ended normally.
+    SessionEnded,
+    /// Error from daemon.
+    Error(String),
+    /// Connection error or disconnect.
+    Disconnected(String),
+}
+
 async fn attach_loop(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    mut reader: tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<()> {
     let async_stdin = AsyncFd::new(NonOwningFd(libc::STDIN_FILENO))?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
+    // Spawn a dedicated reader task for daemon messages.
+    // try_read_frame_async is NOT cancel-safe (two sequential read_exact calls),
+    // so it must not be used directly in tokio::select!. A dedicated task ensures
+    // the frame read is never cancelled mid-parse, preventing stream corruption.
+    let (daemon_msg_tx, mut daemon_msg_rx) = tokio::sync::mpsc::channel::<DaemonEvent>(32);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match try_read_frame_async::<DaemonMessage>(&mut reader).await {
+                Some(Ok(DaemonMessage::Output(data))) => {
+                    if daemon_msg_tx.send(DaemonEvent::Output(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(DaemonMessage::SessionEnded)) => {
+                    let _ = daemon_msg_tx.send(DaemonEvent::SessionEnded).await;
+                    break;
+                }
+                Some(Ok(DaemonMessage::Error(e))) => {
+                    let _ = daemon_msg_tx.send(DaemonEvent::Error(e)).await;
+                    break;
+                }
+                Some(Err(e)) => {
+                    let _ = daemon_msg_tx
+                        .send(DaemonEvent::Disconnected(format!("connection error: {}", e)))
+                        .await;
+                    break;
+                }
+                None => {
+                    let _ = daemon_msg_tx
+                        .send(DaemonEvent::Disconnected("disconnected from server".into()))
+                        .await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
     let mut prefix_pending = false;
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 4096];
 
-    loop {
+    let result = loop {
         tokio::select! {
-            // Data from daemon → terminal stdout.
-            msg = try_read_frame_async::<DaemonMessage>(reader) => {
+            // Data from daemon → terminal stdout (via cancel-safe channel).
+            msg = daemon_msg_rx.recv() => {
                 match msg {
-                    Some(Ok(DaemonMessage::Output(data))) => {
+                    Some(DaemonEvent::Output(data)) => {
                         stdout.write_all(&data)?;
                         stdout.flush()?;
                     }
-                    Some(Ok(DaemonMessage::SessionEnded)) => {
+                    Some(DaemonEvent::SessionEnded) => {
                         eprintln!("\r\namux: session ended");
-                        return Ok(());
+                        break Ok(());
                     }
-                    Some(Ok(DaemonMessage::Error(e))) => {
+                    Some(DaemonEvent::Error(e)) => {
                         eprintln!("\r\namux: error: {}", e);
-                        return Ok(());
+                        break Ok(());
                     }
-                    Some(Err(e)) => {
-                        eprintln!("\r\namux: connection error: {}", e);
-                        return Ok(());
+                    Some(DaemonEvent::Disconnected(msg)) => {
+                        eprintln!("\r\namux: {}", msg);
+                        break Ok(());
                     }
                     None => {
                         eprintln!("\r\namux: disconnected from server");
-                        return Ok(());
+                        break Ok(());
                     }
-                    _ => {}
                 }
             }
             // Raw stdin → daemon.
@@ -105,20 +154,25 @@ async fn attach_loop(
                         Ok(n as usize)
                     }
                 }) {
-                    Ok(Ok(0)) => return Ok(()), // EOF
+                    Ok(Ok(0)) => break Ok(()), // EOF
                     Ok(Ok(n)) => {
                         let data = &buf[..n];
-                        tracing::trace!("stdin: {} raw bytes", n);
+                        if std::env::var("AMUX_DEBUG").is_ok() {
+                            eprintln!("\r\namux-debug: stdin read {} bytes: {:?}", n, &data[..n.min(32)]);
+                        }
                         match process_raw_input(data, &mut prefix_pending) {
                             Some(InputAction::Detach) => {
                                 let _ = write_frame_async(writer, &ClientMessage::Detach).await;
                                 eprintln!("\r\namux: detached");
-                                return Ok(());
+                                break Ok(());
                             }
-                            Some(InputAction::Send(bytes)) => {
+                            Some(InputAction::Send(ref bytes)) => {
+                                if std::env::var("AMUX_DEBUG").is_ok() {
+                                    eprintln!("\r\namux-debug: sending {} bytes as AttachInput", bytes.len());
+                                }
                                 let _ = write_frame_async(
                                     writer,
-                                    &ClientMessage::AttachInput(bytes),
+                                    &ClientMessage::AttachInput(bytes.clone()),
                                 ).await;
                             }
                             None => {}
@@ -126,10 +180,16 @@ async fn attach_loop(
                     }
                     Ok(Err(e)) => {
                         if e.kind() != std::io::ErrorKind::WouldBlock {
-                            return Err(e.into());
+                            if std::env::var("AMUX_DEBUG").is_ok() {
+                                eprintln!("\r\namux-debug: stdin read error: {}", e);
+                            }
+                            break Err(e.into());
                         }
                     }
-                    Err(_would_block) => continue,
+                    Err(_would_block) => {
+                        // Spurious readiness — retry
+                        continue;
+                    }
                 }
             }
             // SIGWINCH → resize.
@@ -142,7 +202,10 @@ async fn attach_loop(
                 }
             }
         }
-    }
+    };
+
+    reader_task.abort();
+    result
 }
 
 enum InputAction {

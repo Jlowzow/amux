@@ -148,10 +148,10 @@ async fn handle_connection(
                 .await;
             }
             ClientMessage::Attach { name, cols, rows } => {
-                // Handle attach: stream output from session.
-                handle_attach(&mut reader, &mut writer, registry.clone(), &name, cols, rows)
+                // Attach takes ownership of reader/writer (connection is consumed).
+                handle_attach(reader, writer, registry.clone(), &name, cols, rows)
                     .await;
-                return; // Attach takes over the connection.
+                return;
             }
             ClientMessage::SendInput {
                 name,
@@ -323,8 +323,8 @@ async fn handle_connection(
 }
 
 async fn handle_attach(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
     registry: Arc<Mutex<Registry>>,
     name: &str,
     cols: u16,
@@ -337,7 +337,7 @@ async fn handle_attach(
             Some(s) => s,
             None => {
                 let _ = write_frame_async(
-                    writer,
+                    &mut writer,
                     &DaemonMessage::Error(format!("session '{}' not found", name)),
                 )
                 .await;
@@ -363,8 +363,30 @@ async fn handle_attach(
 
     // Send scrollback first.
     if !scrollback_data.is_empty() {
-        let _ = write_frame_async(writer, &DaemonMessage::Output(scrollback_data)).await;
+        let _ = write_frame_async(&mut writer, &DaemonMessage::Output(scrollback_data)).await;
     }
+
+    // Spawn a dedicated reader task for client messages.
+    // try_read_frame_async is NOT cancel-safe (two sequential read_exact calls),
+    // so it must not be used directly in tokio::select!. A dedicated task ensures
+    // the frame read is never cancelled mid-parse, preventing stream corruption.
+    let (client_msg_tx, mut client_msg_rx) = tokio::sync::mpsc::channel::<ClientMessage>(32);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match try_read_frame_async::<ClientMessage>(&mut reader).await {
+                Some(Ok(msg)) => {
+                    if client_msg_tx.send(msg).await.is_err() {
+                        break; // Receiver dropped, attach ended.
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::debug!("attach read error: {}", e);
+                    break;
+                }
+                None => break, // Client disconnected.
+            }
+        }
+    });
 
     // Bidirectional streaming (no registry lock needed in the hot path).
     loop {
@@ -375,41 +397,39 @@ async fn handle_attach(
                     Ok(data) => {
                         // Scrollback is now stored by io_loop in session.rs,
                         // so no registry lock needed here.
-                        if write_frame_async(writer, &DaemonMessage::Output(data)).await.is_err() {
-                            return; // Client disconnected.
+                        if write_frame_async(&mut writer, &DaemonMessage::Output(data)).await.is_err() {
+                            break; // Client disconnected.
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("output lagged by {} messages", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        let _ = write_frame_async(writer, &DaemonMessage::SessionEnded).await;
-                        return;
+                        let _ = write_frame_async(&mut writer, &DaemonMessage::SessionEnded).await;
+                        break;
                     }
                 }
             }
-            // Input from client → PTY.
-            msg = try_read_frame_async::<ClientMessage>(reader) => {
+            // Input from client → PTY (via cancel-safe channel).
+            msg = client_msg_rx.recv() => {
                 match msg {
-                    Some(Ok(ClientMessage::AttachInput(data))) => {
+                    Some(ClientMessage::AttachInput(data)) => {
                         tracing::trace!("attach input: {} bytes", data.len());
                         let _ = input_tx.send(data).await;
                     }
-                    Some(Ok(ClientMessage::AttachResize { cols, rows })) => {
+                    Some(ClientMessage::AttachResize { cols, rows }) => {
                         let _ = resize_tx.send((cols, rows)).await;
                     }
-                    Some(Ok(ClientMessage::Detach)) | None => {
-                        return; // Client detached or disconnected.
+                    Some(ClientMessage::Detach) | None => {
+                        break; // Client detached or disconnected.
                     }
-                    Some(Ok(_)) => {
+                    Some(_) => {
                         // Ignore unexpected messages during attach.
-                    }
-                    Some(Err(e)) => {
-                        tracing::debug!("attach read error: {}", e);
-                        return;
                     }
                 }
             }
         }
     }
+
+    reader_task.abort();
 }
