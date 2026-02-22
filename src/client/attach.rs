@@ -63,6 +63,7 @@ async fn attach_loop(
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key_event))) => {
+                        tracing::trace!("key event: {:?}", key_event);
                         if let Some(action) = handle_key(key_event, &mut prefix_pending) {
                             match action {
                                 KeyAction::Detach => {
@@ -71,6 +72,7 @@ async fn attach_loop(
                                     return Ok(());
                                 }
                                 KeyAction::Send(data) => {
+                                    tracing::trace!("sending {} input bytes", data.len());
                                     let _ = write_frame_async(
                                         writer,
                                         &ClientMessage::AttachInput(data),

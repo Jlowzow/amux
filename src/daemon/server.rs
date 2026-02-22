@@ -392,6 +392,7 @@ async fn handle_attach(
             msg = try_read_frame_async::<ClientMessage>(reader) => {
                 match msg {
                     Some(Ok(ClientMessage::AttachInput(data))) => {
+                        tracing::trace!("attach input: {} bytes", data.len());
                         let _ = input_tx.send(data).await;
                     }
                     Some(Ok(ClientMessage::AttachResize { cols, rows })) => {

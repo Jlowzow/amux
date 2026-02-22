@@ -640,6 +640,8 @@ fn parse_env_vars(
 #[cfg(test)]
 mod tests {
     use super::strip_ansi;
+    use crate::protocol::codec::{try_read_frame_async, write_frame_async};
+    use crate::protocol::messages::{ClientMessage, DaemonMessage};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -702,5 +704,375 @@ mod tests {
         assert!(result_str.contains("ALIVE"));
         // Should not contain any ESC characters
         assert!(!result.contains(&0x1b));
+    }
+
+    /// Integration test: verify AttachInput reaches the child process via daemon.
+    /// This bypasses crossterm entirely and tests the daemon's handle_attach path.
+    #[tokio::test]
+    async fn test_attach_input_reaches_session() {
+        use tokio::sync::broadcast;
+
+        // Use a temp socket to avoid conflicting with a running daemon.
+        let dir = std::env::temp_dir().join(format!("amux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        // Run server in background.
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Connect and create a session running `cat`.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("input-test".to_string()),
+                command: vec!["cat".to_string()],
+                env: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::SessionCreated { .. }),
+            "expected SessionCreated, got {:?}",
+            resp
+        );
+
+        // Give the session time to start and initialize the PTY.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Attach to the session on the same connection.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::Attach {
+                name: "input-test".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Read any initial scrollback/output (shell prompt etc).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Drain any pending output before sending our input.
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(_))) => continue,
+                        _ => break,
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => break,
+            }
+        }
+
+        // === Test 1: AttachInput with \n (like SendInput uses) ===
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::AttachInput(b"hello\n".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            // cat echoes input + writes it to stdout.
+                            // Look for "hello" in the output.
+                            let plain = strip_ansi(&output);
+                            if plain.windows(5).any(|w| w == b"hello") {
+                                break;
+                            }
+                        }
+                        Some(Ok(DaemonMessage::SessionEnded)) => {
+                            panic!("session ended unexpectedly");
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let plain = strip_ansi(&output);
+                    panic!(
+                        "timeout waiting for 'hello' in output.\nRaw output ({} bytes): {:?}\nPlain: {:?}",
+                        output.len(),
+                        String::from_utf8_lossy(&output),
+                        String::from_utf8_lossy(&plain)
+                    );
+                }
+            }
+        }
+
+        // === Test 2: AttachInput with \r (what crossterm sends for Enter) ===
+        output.clear();
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::AttachInput(b"world\r".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            if plain.windows(5).any(|w| w == b"world") {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let plain = strip_ansi(&output);
+                    panic!(
+                        "timeout waiting for 'world' in output (\\r test).\nRaw output ({} bytes): {:?}\nPlain: {:?}",
+                        output.len(),
+                        String::from_utf8_lossy(&output),
+                        String::from_utf8_lossy(&plain)
+                    );
+                }
+            }
+        }
+
+        // Clean up: detach and kill session.
+        let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: AttachInput with individual keystrokes (like crossterm sends).
+    /// This mimics how the real attach client sends each key as a separate message.
+    #[tokio::test]
+    async fn test_attach_input_individual_keys() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("keys-test".to_string()),
+                command: vec!["cat".to_string()],
+                env: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Attach.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::Attach {
+                name: "keys-test".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Drain initial output.
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(_))) => continue,
+                        _ => break,
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => break,
+            }
+        }
+
+        // Send individual characters like crossterm would: h, e, l, l, o, \r
+        for &byte in b"hello" {
+            write_frame_async(
+                &mut writer,
+                &ClientMessage::AttachInput(vec![byte]),
+            )
+            .await
+            .unwrap();
+            // Small delay between keystrokes, simulating human typing.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Send Enter as \r (what crossterm sends for KeyCode::Enter).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::AttachInput(vec![b'\r']),
+        )
+        .await
+        .unwrap();
+
+        // Read output and look for "hello".
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            if plain.windows(5).any(|w| w == b"hello") {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let plain = strip_ansi(&output);
+                    panic!(
+                        "timeout waiting for 'hello' with individual keys.\nRaw ({} bytes): {:?}\nPlain: {:?}",
+                        output.len(),
+                        String::from_utf8_lossy(&output),
+                        String::from_utf8_lossy(&plain)
+                    );
+                }
+            }
+        }
+
+        let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: verify SendInput path works (for comparison with AttachInput).
+    #[tokio::test]
+    async fn test_send_input_reaches_session() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-send-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Connection 1: create session.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("send-test".to_string()),
+                command: vec!["cat".to_string()],
+                env: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Send input via SendInput (the working path).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::SendInput {
+                name: "send-test".to_string(),
+                data: b"hello".to_vec(),
+                newline: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::InputSent),
+            "expected InputSent, got {:?}",
+            resp
+        );
+
+        // Wait for output to be generated, then capture scrollback.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CaptureScrollback {
+                name: "send-test".to_string(),
+                lines: 10,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::CaptureOutput(data) => {
+                let plain = strip_ansi(&data);
+                let output_str = String::from_utf8_lossy(&plain);
+                assert!(
+                    output_str.contains("hello"),
+                    "SendInput: expected 'hello' in scrollback, got: {:?}",
+                    output_str
+                );
+            }
+            other => panic!("expected CaptureOutput, got {:?}", other),
+        }
+
+        // Clean up.
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

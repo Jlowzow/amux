@@ -287,20 +287,42 @@ impl Session {
                 }
                 // Write client input → PTY master.
                 Some(data) = input_rx.recv() => {
-                    let raw = master_async.as_raw_fd();
                     let mut offset = 0;
                     while offset < data.len() {
-                        let n = unsafe {
-                            libc::write(
-                                raw,
-                                data[offset..].as_ptr() as *const libc::c_void,
-                                data.len() - offset,
-                            )
+                        // Wait for the fd to be writable (handles non-blocking EAGAIN).
+                        let mut guard = match master_async.writable().await {
+                            Ok(g) => g,
+                            Err(e) => {
+                                tracing::debug!("pty writable error: {}", e);
+                                break;
+                            }
                         };
-                        if n <= 0 {
-                            break;
+                        match guard.try_io(|fd| {
+                            let raw = fd.as_raw_fd();
+                            let n = unsafe {
+                                libc::write(
+                                    raw,
+                                    data[offset..].as_ptr() as *const libc::c_void,
+                                    data.len() - offset,
+                                )
+                            };
+                            if n < 0 {
+                                Err(std::io::Error::last_os_error())
+                            } else {
+                                Ok(n as usize)
+                            }
+                        }) {
+                            Ok(Ok(0)) => break, // EOF on write
+                            Ok(Ok(n)) => { offset += n; }
+                            Ok(Err(e)) => {
+                                if e.kind() != std::io::ErrorKind::WouldBlock {
+                                    tracing::debug!("pty write error: {}", e);
+                                    break;
+                                }
+                                // WouldBlock: try_io cleared readiness, loop retries writable()
+                            }
+                            Err(_would_block) => continue, // Spurious readiness, retry
                         }
-                        offset += n as usize;
                     }
                 }
                 // Handle resize.
