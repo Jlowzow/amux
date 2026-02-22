@@ -1,11 +1,25 @@
 use std::io::Write;
+use std::os::unix::io::{AsRawFd, RawFd};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
-use futures::StreamExt;
+use nix::libc;
+use tokio::io::unix::AsyncFd;
+use tokio::signal::unix::{signal, SignalKind};
 
 use crate::protocol::codec::{try_read_frame_async, write_frame_async};
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
+
+const CTRL_B: u8 = 0x02;
+
+/// Non-owning wrapper around a raw fd for use with AsyncFd.
+/// Does NOT close the fd on drop (stdin lifetime is managed by the process).
+struct NonOwningFd(RawFd);
+
+impl AsRawFd for NonOwningFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 /// Run the attach loop: bidirectional I/O between terminal and daemon.
 pub async fn run_attach(
@@ -15,9 +29,20 @@ pub async fn run_attach(
     // Enable raw mode.
     terminal::enable_raw_mode()?;
 
+    // Set stdin to non-blocking for async reads.
+    let stdin_fd = libc::STDIN_FILENO;
+    let old_flags = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_GETFL)
+        .map_err(|e| anyhow::anyhow!("fcntl F_GETFL: {}", e))?;
+    let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
+    new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+    nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags))
+        .map_err(|e| anyhow::anyhow!("fcntl F_SETFL: {}", e))?;
+
     let result = attach_loop(reader, writer).await;
 
-    // Always restore terminal.
+    // Restore stdin to blocking mode and terminal to cooked mode.
+    let restore_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
+    let _ = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(restore_flags));
     terminal::disable_raw_mode()?;
 
     result
@@ -27,9 +52,12 @@ async fn attach_loop(
     reader: &mut tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<()> {
-    let mut event_stream = EventStream::new();
+    let async_stdin = AsyncFd::new(NonOwningFd(libc::STDIN_FILENO))?;
+    let mut sigwinch = signal(SignalKind::window_change())?;
+
     let mut prefix_pending = false;
     let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 4096];
 
     loop {
         tokio::select! {
@@ -59,134 +87,179 @@ async fn attach_loop(
                     _ => {}
                 }
             }
-            // Terminal events → daemon.
-            event = event_stream.next() => {
-                match event {
-                    Some(Ok(Event::Key(key_event))) => {
-                        tracing::trace!("key event: {:?}", key_event);
-                        if let Some(action) = handle_key(key_event, &mut prefix_pending) {
-                            match action {
-                                KeyAction::Detach => {
-                                    let _ = write_frame_async(writer, &ClientMessage::Detach).await;
-                                    eprintln!("\r\namux: detached");
-                                    return Ok(());
-                                }
-                                KeyAction::Send(data) => {
-                                    tracing::trace!("sending {} input bytes", data.len());
-                                    let _ = write_frame_async(
-                                        writer,
-                                        &ClientMessage::AttachInput(data),
-                                    )
-                                    .await;
-                                }
+            // Raw stdin → daemon.
+            readable = async_stdin.readable() => {
+                let mut guard = readable?;
+                match guard.try_io(|fd| {
+                    let raw = fd.as_raw_fd();
+                    let n = unsafe {
+                        libc::read(
+                            raw,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    Ok(Ok(0)) => return Ok(()), // EOF
+                    Ok(Ok(n)) => {
+                        let data = &buf[..n];
+                        tracing::trace!("stdin: {} raw bytes", n);
+                        match process_raw_input(data, &mut prefix_pending) {
+                            Some(InputAction::Detach) => {
+                                let _ = write_frame_async(writer, &ClientMessage::Detach).await;
+                                eprintln!("\r\namux: detached");
+                                return Ok(());
                             }
+                            Some(InputAction::Send(bytes)) => {
+                                let _ = write_frame_async(
+                                    writer,
+                                    &ClientMessage::AttachInput(bytes),
+                                ).await;
+                            }
+                            None => {}
                         }
                     }
-                    Some(Ok(Event::Resize(cols, rows))) => {
-                        let _ = write_frame_async(
-                            writer,
-                            &ClientMessage::AttachResize { cols, rows },
-                        )
-                        .await;
+                    Ok(Err(e)) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(e.into());
+                        }
                     }
-                    Some(Ok(Event::Paste(text))) => {
-                        let _ = write_frame_async(
-                            writer,
-                            &ClientMessage::AttachInput(text.into_bytes()),
-                        )
-                        .await;
-                    }
-                    Some(Err(_)) | None => {
-                        return Ok(());
-                    }
-                    _ => {}
+                    Err(_would_block) => continue,
+                }
+            }
+            // SIGWINCH → resize.
+            _ = sigwinch.recv() => {
+                if let Ok((cols, rows)) = terminal::size() {
+                    let _ = write_frame_async(
+                        writer,
+                        &ClientMessage::AttachResize { cols, rows },
+                    ).await;
                 }
             }
         }
     }
 }
 
-enum KeyAction {
+enum InputAction {
     Detach,
     Send(Vec<u8>),
 }
 
-/// Handle a key event, managing the Ctrl+B prefix key for detach.
-fn handle_key(event: KeyEvent, prefix_pending: &mut bool) -> Option<KeyAction> {
-    // Ctrl+B is our prefix key (like tmux).
-    if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('b') {
-        if !*prefix_pending {
+/// Process raw input bytes. Only intercepts Ctrl+B (0x02) for the detach prefix.
+/// All other bytes are forwarded verbatim to the session.
+fn process_raw_input(data: &[u8], prefix_pending: &mut bool) -> Option<InputAction> {
+    // Fast path: no prefix pending and no Ctrl+B in data → forward verbatim.
+    if !*prefix_pending && !data.contains(&CTRL_B) {
+        return Some(InputAction::Send(data.to_vec()));
+    }
+
+    let mut output = Vec::with_capacity(data.len());
+
+    for &byte in data {
+        if *prefix_pending {
+            *prefix_pending = false;
+            match byte {
+                b'd' | b'D' => return Some(InputAction::Detach),
+                CTRL_B => output.push(CTRL_B), // Double Ctrl+B → literal Ctrl+B.
+                _ => {} // Unknown prefix command → discard.
+            }
+        } else if byte == CTRL_B {
             *prefix_pending = true;
-            return None; // Eat the prefix key.
-        }
-        // Double Ctrl+B sends a literal Ctrl+B.
-        *prefix_pending = false;
-        return Some(KeyAction::Send(vec![2])); // Ctrl+B = 0x02
-    }
-
-    if *prefix_pending {
-        *prefix_pending = false;
-        match event.code {
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                return Some(KeyAction::Detach);
-            }
-            _ => {
-                // Unknown prefix command, ignore.
-                return None;
-            }
+        } else {
+            output.push(byte);
         }
     }
 
-    // Normal key → convert to bytes.
-    let bytes = key_to_bytes(event)?;
-    Some(KeyAction::Send(bytes))
+    if output.is_empty() {
+        None
+    } else {
+        Some(InputAction::Send(output))
+    }
 }
 
-fn key_to_bytes(event: KeyEvent) -> Option<Vec<u8>> {
-    match event.code {
-        KeyCode::Char(c) => {
-            if event.modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+letter → 1-26
-                let ctrl = (c as u8).wrapping_sub(b'a').wrapping_add(1);
-                Some(vec![ctrl])
-            } else {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                Some(s.as_bytes().to_vec())
-            }
-        }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![127]),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::Esc => Some(vec![27]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
-        KeyCode::F(n) => {
-            let seq = match n {
-                1 => "\x1bOP",
-                2 => "\x1bOQ",
-                3 => "\x1bOR",
-                4 => "\x1bOS",
-                5 => "\x1b[15~",
-                6 => "\x1b[17~",
-                7 => "\x1b[18~",
-                8 => "\x1b[19~",
-                9 => "\x1b[20~",
-                10 => "\x1b[21~",
-                11 => "\x1b[23~",
-                12 => "\x1b[24~",
-                _ => return None,
-            };
-            Some(seq.as_bytes().to_vec())
-        }
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_raw_input_passthrough() {
+        let mut prefix = false;
+        let result = process_raw_input(b"hello", &mut prefix);
+        assert!(matches!(result, Some(InputAction::Send(ref d)) if d == b"hello"));
+        assert!(!prefix);
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_b_sets_prefix() {
+        let mut prefix = false;
+        let result = process_raw_input(&[CTRL_B], &mut prefix);
+        assert!(result.is_none());
+        assert!(prefix);
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_b_d_detaches() {
+        let mut prefix = true;
+        let result = process_raw_input(b"d", &mut prefix);
+        assert!(matches!(result, Some(InputAction::Detach)));
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_b_upper_d_detaches() {
+        let mut prefix = true;
+        let result = process_raw_input(b"D", &mut prefix);
+        assert!(matches!(result, Some(InputAction::Detach)));
+    }
+
+    #[test]
+    fn test_raw_input_double_ctrl_b_sends_literal() {
+        let mut prefix = true;
+        let result = process_raw_input(&[CTRL_B], &mut prefix);
+        assert!(matches!(result, Some(InputAction::Send(ref d)) if d == &[CTRL_B]));
+        assert!(!prefix);
+    }
+
+    #[test]
+    fn test_raw_input_unknown_prefix_discards() {
+        let mut prefix = true;
+        let result = process_raw_input(b"x", &mut prefix);
+        assert!(result.is_none());
+        assert!(!prefix);
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_b_in_middle_of_data() {
+        let mut prefix = false;
+        // "ab" + Ctrl+B + "cd" → sends "abcd" with prefix pending after Ctrl+B?
+        // No: "ab" then Ctrl+B sets prefix, then 'c' resolves prefix (unknown → discard),
+        // then 'd' is normal.
+        let data = [b'a', b'b', CTRL_B, b'c', b'd'];
+        let result = process_raw_input(&data, &mut prefix);
+        // 'a','b' → output, Ctrl+B → prefix, 'c' → unknown prefix discard, 'd' → output
+        assert!(matches!(result, Some(InputAction::Send(ref d)) if d == b"abd"));
+        assert!(!prefix);
+    }
+
+    #[test]
+    fn test_raw_input_escape_sequences_passthrough() {
+        let mut prefix = false;
+        // Arrow up: ESC [ A
+        let data = b"\x1b[A";
+        let result = process_raw_input(data, &mut prefix);
+        assert!(matches!(result, Some(InputAction::Send(ref d)) if d == b"\x1b[A"));
+    }
+
+    #[test]
+    fn test_raw_input_ctrl_b_at_end_leaves_prefix() {
+        let mut prefix = false;
+        let data = [b'x', CTRL_B];
+        let result = process_raw_input(&data, &mut prefix);
+        assert!(matches!(result, Some(InputAction::Send(ref d)) if d == b"x"));
+        assert!(prefix); // Ctrl+B at end leaves prefix pending for next read.
     }
 }
