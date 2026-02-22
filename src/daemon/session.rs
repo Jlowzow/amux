@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use nix::libc;
 use nix::pty::{openpty, Winsize};
-use nix::sys::termios;
 use nix::unistd::{self, ForkResult};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -110,19 +109,15 @@ impl Session {
         let pty = openpty(Some(&winsize), None)?;
         let slave_fd = pty.slave.as_raw_fd();
 
-        // Start from raw mode (disables canonical processing, signals, etc.)
-        // but re-enable ECHO so that input written to the master side is
-        // echoed back through the slave's output — matching normal terminal
-        // behaviour where typed commands are visible.
-        let mut termios_settings = termios::tcgetattr(&pty.slave)?;
-        termios::cfmakeraw(&mut termios_settings);
-        termios_settings.local_flags.insert(
-            termios::LocalFlags::ECHO
-                | termios::LocalFlags::ECHOE
-                | termios::LocalFlags::ECHOK
-                | termios::LocalFlags::ECHOCTL,
-        );
-        termios::tcsetattr(&pty.slave, termios::SetArg::TCSANOW, &termios_settings)?;
+        // Use default cooked terminal settings on the PTY slave.
+        // openpty() provides sane defaults (OPOST, ONLCR, ICRNL, ISIG,
+        // ICANON, ECHO, etc.) — the same settings a real terminal has.
+        // Raw mode belongs only on the attach client side, not the slave.
+        //
+        // Previously cfmakeraw was used here, which broke:
+        //   - Display: no OPOST/ONLCR → \n not converted to \r\n (staircase)
+        //   - Input:   no ICRNL → Enter (\r) not mapped to \n
+        //   - Signals: no ISIG  → Ctrl+C didn't generate SIGINT
 
         // Fork child process.
         let child_pid = match unsafe { unistd::fork() }? {
