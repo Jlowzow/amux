@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
 
 #[derive(Parser)]
-#[command(name = "amux", about = "AI Agent Multiplexer")]
+#[command(name = "amux", about = "AI Agent Multiplexer", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -983,6 +983,18 @@ mod tests {
         let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_version_flag_recognized() {
+        // --version should be recognized by the CLI parser.
+        // clap returns Err(DisplayVersion) when --version is passed.
+        use clap::Parser;
+        let result = super::Cli::try_parse_from(["amux", "--version"]);
+        match result {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion),
+            Ok(_) => panic!("expected --version to produce DisplayVersion error"),
+        }
     }
 
     /// Integration test: verify SendInput path works (for comparison with AttachInput).
