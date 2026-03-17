@@ -543,10 +543,17 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
         .build()?;
 
     rt.block_on(async {
-        let std_stream = stream.into_raw_fd();
+        let raw_fd = stream.into_raw_fd();
+        // Set O_NONBLOCK before converting to tokio — newer tokio panics on blocking fds.
+        let old_flags = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFL)
+            .map_err(|e| anyhow::anyhow!("fcntl F_GETFL on socket: {}", e))?;
+        let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
+        new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+        nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags))
+            .map_err(|e| anyhow::anyhow!("fcntl F_SETFL on socket: {}", e))?;
         let tokio_stream = unsafe {
             tokio::net::UnixStream::from_std(
-                std::os::unix::net::UnixStream::from_raw_fd(std_stream),
+                std::os::unix::net::UnixStream::from_raw_fd(raw_fd),
             )?
         };
         let (reader, mut writer) = tokio_stream.into_split();
@@ -995,6 +1002,44 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion),
             Ok(_) => panic!("expected --version to produce DisplayVersion error"),
         }
+    }
+
+    /// Regression test: tokio::net::UnixStream::from_std requires O_NONBLOCK.
+    /// Without it, newer tokio versions panic. This validates our fix in do_attach().
+    #[tokio::test]
+    async fn test_unix_stream_needs_nonblocking_for_tokio() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+
+        let dir = std::env::temp_dir().join(format!("amux-test-nb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let std_stream = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+
+        // The fd starts as blocking
+        let fd = std_stream.as_raw_fd();
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        let oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
+        assert!(
+            !oflags.contains(nix::fcntl::OFlag::O_NONBLOCK),
+            "std socket should start blocking"
+        );
+
+        // Set O_NONBLOCK (this is what our fix does)
+        let mut new_flags = oflags;
+        new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(new_flags)).unwrap();
+
+        // Now from_std should succeed without panic
+        let raw_fd = std_stream.into_raw_fd();
+        let rebuilt = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
+        let tokio_stream = tokio::net::UnixStream::from_std(rebuilt);
+        assert!(tokio_stream.is_ok(), "from_std must succeed with O_NONBLOCK set");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Integration test: verify SendInput path works (for comparison with AttachInput).
