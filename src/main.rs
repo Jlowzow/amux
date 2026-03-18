@@ -449,10 +449,12 @@ fn main() -> anyhow::Result<()> {
         } => {
             ensure_daemon_running()?;
             let joined = text.join(" ");
+            let needs_enter = !literal;
+            // Send text without newline first.
             let resp = client::request(&ClientMessage::SendInput {
                 name: name.clone(),
                 data: joined.into_bytes(),
-                newline: !literal,
+                newline: false,
             })?;
             match resp {
                 DaemonMessage::InputSent => {}
@@ -461,6 +463,24 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 other => eprintln!("amux: unexpected: {:?}", other),
+            }
+            if needs_enter {
+                // Wait for TUI to process the text, then send Enter separately.
+                // This prevents bracketed-paste-aware TUIs from swallowing Enter.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let resp = client::request(&ClientMessage::SendInput {
+                    name: name.clone(),
+                    data: vec![b'\r'],
+                    newline: false,
+                })?;
+                match resp {
+                    DaemonMessage::InputSent => {}
+                    DaemonMessage::Error(e) => {
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
             }
         }
         Command::Has { name } => {

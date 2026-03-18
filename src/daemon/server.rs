@@ -165,11 +165,10 @@ async fn handle_connection(
             } => {
                 let reg = registry.lock().await;
                 if let Some(session) = reg.get(&name) {
-                    let mut payload = data;
+                    let _ = session.input_tx.send(data).await;
                     if newline {
-                        payload.push(b'\n');
+                        let _ = session.input_tx.send(vec![b'\r']).await;
                     }
-                    let _ = session.input_tx.send(payload).await;
                     let _ =
                         write_frame_async(&mut writer, &DaemonMessage::InputSent).await;
                 } else {
