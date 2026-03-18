@@ -3,6 +3,8 @@ mod common;
 mod daemon;
 mod protocol;
 
+use std::collections::HashMap;
+
 use clap::{Parser, Subcommand};
 
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
@@ -30,6 +32,9 @@ enum Command {
         /// Working directory for the session
         #[arg(short = 'c', long = "cwd")]
         cwd: Option<String>,
+        /// Create a git worktree and run the session in it
+        #[arg(short = 'w', long = "worktree")]
+        worktree: Option<String>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -179,6 +184,7 @@ fn main() -> anyhow::Result<()> {
             detached: false,
             env: Vec::new(),
             cwd: None,
+            worktree: None,
             cmd: vec![shell],
         }
     });
@@ -242,6 +248,7 @@ fn main() -> anyhow::Result<()> {
             detached,
             env,
             cwd,
+            worktree,
             cmd,
         } => {
             if std::env::var("AMUX_DEBUG").is_ok() {
@@ -251,7 +258,18 @@ fn main() -> anyhow::Result<()> {
             if std::env::var("AMUX_DEBUG").is_ok() {
                 eprintln!("amux-debug: daemon running, parsing env");
             }
-            let env_map = parse_env_vars(&env)?;
+            let mut env_map = parse_env_vars(&env)?;
+
+            // Handle --worktree: create a git worktree, set cwd to it, store metadata.
+            let cwd = if let Some(ref branch) = worktree {
+                let worktree_path = create_git_worktree(branch)?;
+                let env = env_map.get_or_insert_with(HashMap::new);
+                env.insert("AMUX_WORKTREE_PATH".to_string(), worktree_path.clone());
+                env.insert("AMUX_WORKTREE_BRANCH".to_string(), branch.clone());
+                Some(worktree_path)
+            } else {
+                cwd
+            };
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
                     name,
@@ -853,13 +871,62 @@ fn strip_ansi(input: &[u8]) -> Vec<u8> {
 }
 
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
+/// Create a git worktree for the given branch name.
+/// Returns the absolute path to the new worktree directory.
+fn create_git_worktree(branch: &str) -> anyhow::Result<String> {
+    // Get the git toplevel to derive a worktree path.
+    let toplevel = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !toplevel.status.success() {
+        anyhow::bail!(
+            "not a git repository (git rev-parse --show-toplevel failed)"
+        );
+    }
+    let repo_root = String::from_utf8(toplevel.stdout)?.trim().to_string();
+
+    // Place worktrees in a sibling directory: <repo>-<branch>
+    let repo_name = std::path::Path::new(&repo_root)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let parent = std::path::Path::new(&repo_root)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"));
+    let worktree_path = parent.join(format!("{}-{}", repo_name, branch));
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", &worktree_str, "-b", branch])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git worktree add failed: {}", stderr.trim());
+    }
+
+    eprintln!("amux: created worktree at {}", worktree_str);
+    Ok(worktree_str)
+}
+
+/// Remove a git worktree directory.
+fn remove_git_worktree(worktree_path: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_path])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git worktree remove failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 fn parse_env_vars(
     vars: &[String],
-) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
+) -> anyhow::Result<Option<HashMap<String, String>>> {
     if vars.is_empty() {
         return Ok(None);
     }
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
     for var in vars {
         let (key, value) = var
             .split_once('=')
@@ -1894,6 +1961,165 @@ mod tests {
             "expected Error(not found), got: {:?}",
             resp
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_and_remove_git_worktree() {
+        use super::{create_git_worktree, remove_git_worktree};
+
+        // Create a temporary bare git repo to test worktree creation.
+        let tmp = std::env::temp_dir().join(format!("amux-wt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let repo = tmp.join("test-repo");
+
+        // Init a git repo with an initial commit.
+        let status = std::process::Command::new("git")
+            .args(["init", repo.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "git init failed");
+
+        // Create an initial commit so branches work.
+        let status = std::process::Command::new("git")
+            .args(["-C", repo.to_str().unwrap(),
+                   "-c", "user.email=test@test.com",
+                   "-c", "user.name=Test",
+                   "commit", "--allow-empty", "-m", "init"])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "git commit failed: {}", String::from_utf8_lossy(&status.stderr));
+
+        // Run create_git_worktree from within the repo dir.
+        let old_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo).unwrap();
+
+        let result = create_git_worktree("wt-test-branch");
+        std::env::set_current_dir(&old_dir).unwrap();
+
+        let worktree_path = result.expect("create_git_worktree failed");
+        assert!(
+            std::path::Path::new(&worktree_path).is_dir(),
+            "worktree dir should exist: {}",
+            worktree_path
+        );
+
+        // Verify the worktree path ends with the expected name.
+        assert!(
+            worktree_path.ends_with("test-repo-wt-test-branch"),
+            "unexpected worktree path: {}",
+            worktree_path
+        );
+
+        // Remove the worktree.
+        std::env::set_current_dir(&repo).unwrap();
+        remove_git_worktree(&worktree_path).expect("remove_git_worktree failed");
+        std::env::set_current_dir(&old_dir).unwrap();
+
+        assert!(
+            !std::path::Path::new(&worktree_path).exists(),
+            "worktree dir should be removed"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_create_git_worktree_not_a_repo() {
+        use super::create_git_worktree;
+
+        // Run from a directory that's not a git repo.
+        let tmp = std::env::temp_dir().join(format!("amux-wt-norepo-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let old_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+        let result = create_git_worktree("some-branch");
+        std::env::set_current_dir(&old_dir).unwrap();
+
+        assert!(result.is_err(), "should fail when not in a git repo");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("not a git repository"),
+            "unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Integration test: session created with worktree env vars stores metadata correctly.
+    #[tokio::test]
+    async fn test_session_worktree_env_metadata() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-wt-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Create a session with worktree metadata env vars (simulating what --worktree does).
+        let mut env = std::collections::HashMap::new();
+        env.insert("AMUX_WORKTREE_PATH".to_string(), "/tmp/fake-worktree".to_string());
+        env.insert("AMUX_WORKTREE_BRANCH".to_string(), "test-branch".to_string());
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wt-meta-test".to_string()),
+                command: vec!["sleep".to_string(), "10".to_string()],
+                env: Some(env),
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // Retrieve env vars and verify worktree metadata is stored.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::GetAllEnv {
+                name: "wt-meta-test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::EnvVars(vars) => {
+                assert_eq!(
+                    vars.get("AMUX_WORKTREE_PATH"),
+                    Some(&"/tmp/fake-worktree".to_string())
+                );
+                assert_eq!(
+                    vars.get("AMUX_WORKTREE_BRANCH"),
+                    Some(&"test-branch".to_string())
+                );
+            }
+            other => panic!("expected EnvVars, got {:?}", other),
+        }
 
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
