@@ -104,15 +104,17 @@ mod tests {
             name: Some("test-session".to_string()),
             command: vec!["bash".to_string(), "-c".to_string(), "echo hi".to_string()],
             env: None,
+            cwd: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
         match decoded {
-            ClientMessage::CreateSession { name, command, env } => {
+            ClientMessage::CreateSession { name, command, env, cwd } => {
                 assert_eq!(name, Some("test-session".to_string()));
                 assert_eq!(command, vec!["bash", "-c", "echo hi"]);
                 assert!(env.is_none());
+                assert!(cwd.is_none());
             }
             _ => panic!("expected CreateSession"),
         }
@@ -127,17 +129,38 @@ mod tests {
             name: Some("test".to_string()),
             command: vec!["/bin/bash".to_string()],
             env: Some(env),
+            cwd: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
         match decoded {
-            ClientMessage::CreateSession { name, command, env } => {
+            ClientMessage::CreateSession { name, command, env, .. } => {
                 assert_eq!(name, Some("test".to_string()));
                 assert_eq!(command, vec!["/bin/bash"]);
                 let env = env.unwrap();
                 assert_eq!(env.get("GT_ROLE").unwrap(), "polecat");
                 assert_eq!(env.get("GT_RIG").unwrap(), "gastown");
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_create_session_with_cwd() {
+        let msg = ClientMessage::CreateSession {
+            name: Some("cwd-test".to_string()),
+            command: vec!["bash".to_string()],
+            env: None,
+            cwd: Some("/tmp".to_string()),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
+        match decoded {
+            ClientMessage::CreateSession { name, cwd, .. } => {
+                assert_eq!(name, Some("cwd-test".to_string()));
+                assert_eq!(cwd, Some("/tmp".to_string()));
             }
             _ => panic!("expected CreateSession"),
         }

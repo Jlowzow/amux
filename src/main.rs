@@ -27,6 +27,9 @@ enum Command {
         /// Set environment variable (KEY=VALUE), can be specified multiple times
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
+        /// Working directory for the session
+        #[arg(short = 'c', long = "cwd")]
+        cwd: Option<String>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -61,6 +64,9 @@ enum Command {
         /// Timeout in seconds (0 = wait forever)
         #[arg(long, default_value = "0")]
         timeout: u64,
+        /// Print the exit code after the session exits
+        #[arg(long)]
+        exit_code: bool,
     },
     /// Kill a session (or all sessions with --all)
     Kill {
@@ -157,6 +163,7 @@ fn main() -> anyhow::Result<()> {
             name: None,
             detached: false,
             env: Vec::new(),
+            cwd: None,
             cmd: vec![shell],
         }
     });
@@ -219,6 +226,7 @@ fn main() -> anyhow::Result<()> {
             name,
             detached,
             env,
+            cwd,
             cmd,
         } => {
             if std::env::var("AMUX_DEBUG").is_ok() {
@@ -234,6 +242,7 @@ fn main() -> anyhow::Result<()> {
                     name,
                     command: cmd,
                     env: env_map,
+                    cwd: cwd.clone(),
                 })?;
                 match resp {
                     DaemonMessage::SessionCreated { name } => {
@@ -254,6 +263,7 @@ fn main() -> anyhow::Result<()> {
                     name: name.clone(),
                     command: cmd,
                     env: env_map,
+                    cwd,
                 })?;
                 let session_name = match resp {
                     DaemonMessage::SessionCreated { name } => {
@@ -339,7 +349,11 @@ fn main() -> anyhow::Result<()> {
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
         }
-        Command::Wait { name, timeout } => {
+        Command::Wait {
+            name,
+            timeout,
+            exit_code,
+        } => {
             ensure_daemon_running()?;
             let resp = client::request(&ClientMessage::WaitSession {
                 name: name.clone(),
@@ -347,7 +361,25 @@ fn main() -> anyhow::Result<()> {
             })?;
             match resp {
                 DaemonMessage::SessionExited => {
-                    // Session exited normally.
+                    if exit_code {
+                        let resp =
+                            client::request(&ClientMessage::GetExitCode { name: name.clone() })?;
+                        match resp {
+                            DaemonMessage::ExitCode(Some(code)) => {
+                                println!("{}", code);
+                                std::process::exit(code);
+                            }
+                            DaemonMessage::ExitCode(None) => {
+                                eprintln!("amux: exit code unavailable for session '{}'", name);
+                                std::process::exit(1);
+                            }
+                            DaemonMessage::Error(e) => {
+                                eprintln!("amux: error: {}", e);
+                                std::process::exit(1);
+                            }
+                            other => eprintln!("amux: unexpected: {:?}", other),
+                        }
+                    }
                 }
                 DaemonMessage::Error(e) => {
                     if e == "timeout" {
@@ -769,6 +801,7 @@ mod tests {
                 name: Some("input-test".to_string()),
                 command: vec!["cat".to_string()],
                 env: None,
+                cwd: None,
             },
         )
         .await
@@ -925,6 +958,7 @@ mod tests {
                 name: Some("keys-test".to_string()),
                 command: vec!["cat".to_string()],
                 env: None,
+                cwd: None,
             },
         )
         .await
@@ -1095,6 +1129,7 @@ mod tests {
                 name: Some("send-test".to_string()),
                 command: vec!["cat".to_string()],
                 env: None,
+                cwd: None,
             },
         )
         .await
@@ -1188,6 +1223,7 @@ mod tests {
                 name: Some("sync-attach-test".to_string()),
                 command: vec!["cat".to_string()],
                 env: None,
+                cwd: None,
             },
         )
         .await

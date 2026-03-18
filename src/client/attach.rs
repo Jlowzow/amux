@@ -131,8 +131,8 @@ async fn attach_loop(
                 match msg {
                     Some(DaemonEvent::Output(data)) => {
                         if debug { eprintln!("\r\namux-debug: got Output ({} bytes)", data.len()); }
-                        stdout.write_all(&data)?;
-                        stdout.flush()?;
+                        write_all_retry(&mut stdout, &data)?;
+                        flush_retry(&mut stdout)?;
                     }
                     Some(DaemonEvent::SessionEnded) => {
                         eprintln!("\r\namux: session ended");
@@ -264,6 +264,38 @@ fn process_raw_input(data: &[u8], prefix_pending: &mut bool) -> Option<InputActi
     }
 }
 
+/// Write all bytes to a writer, retrying on WouldBlock.
+///
+/// Setting O_NONBLOCK on stdin also makes stdout non-blocking (they share
+/// the same file description on a terminal). `write_all` doesn't handle
+/// WouldBlock, so we retry manually with a brief yield.
+fn write_all_retry(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        match w.write(&data[offset..]) {
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Flush a writer, retrying on WouldBlock (same reason as write_all_retry).
+fn flush_retry(w: &mut impl Write) -> std::io::Result<()> {
+    loop {
+        match w.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +375,92 @@ mod tests {
         let result = process_raw_input(&data, &mut prefix);
         assert!(matches!(result, Some(InputAction::Send(ref d)) if d == b"x"));
         assert!(prefix); // Ctrl+B at end leaves prefix pending for next read.
+    }
+
+    /// A mock writer that returns WouldBlock for the first N write attempts,
+    /// then succeeds. Simulates a non-blocking stdout.
+    struct WouldBlockWriter {
+        remaining_blocks: usize,
+        written: Vec<u8>,
+        flush_blocks: usize,
+    }
+
+    impl WouldBlockWriter {
+        fn new(write_blocks: usize, flush_blocks: usize) -> Self {
+            Self {
+                remaining_blocks: write_blocks,
+                written: Vec::new(),
+                flush_blocks,
+            }
+        }
+    }
+
+    impl Write for WouldBlockWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining_blocks > 0 {
+                self.remaining_blocks -= 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "would block",
+                ))
+            } else {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_blocks > 0 {
+                self.flush_blocks -= 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "would block",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_all_retry_succeeds_immediately() {
+        let mut w = WouldBlockWriter::new(0, 0);
+        write_all_retry(&mut w, b"hello").unwrap();
+        assert_eq!(w.written, b"hello");
+    }
+
+    #[test]
+    fn test_write_all_retry_retries_on_would_block() {
+        let mut w = WouldBlockWriter::new(3, 0);
+        write_all_retry(&mut w, b"hello").unwrap();
+        assert_eq!(w.written, b"hello");
+    }
+
+    #[test]
+    fn test_flush_retry_succeeds_immediately() {
+        let mut w = WouldBlockWriter::new(0, 0);
+        flush_retry(&mut w).unwrap();
+    }
+
+    #[test]
+    fn test_flush_retry_retries_on_would_block() {
+        let mut w = WouldBlockWriter::new(0, 5);
+        flush_retry(&mut w).unwrap();
+        assert_eq!(w.flush_blocks, 0);
+    }
+
+    #[test]
+    fn test_write_all_retry_propagates_other_errors() {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = write_all_retry(&mut BrokenWriter, b"hello");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

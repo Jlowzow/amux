@@ -60,9 +60,10 @@ impl Registry {
         cols: u16,
         rows: u16,
         env: Option<HashMap<String, String>>,
+        cwd: Option<String>,
     ) -> anyhow::Result<String> {
         let name = self.allocate_name(name)?;
-        let session = Session::spawn(name.clone(), cmd, cols, rows, env)?;
+        let session = Session::spawn(name.clone(), cmd, cols, rows, env, cwd)?;
         self.sessions.insert(name.clone(), session);
         Ok(name)
     }

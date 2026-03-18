@@ -25,6 +25,8 @@ pub struct Session {
     pub scrollback: Arc<StdMutex<Scrollback>>,
     /// Receiver that yields `true` when the session's io_loop exits.
     pub exit_watch: watch::Receiver<bool>,
+    /// Child process exit code, set by io_loop after waitpid.
+    pub exit_code: Arc<StdMutex<Option<i32>>>,
     /// Session-level metadata environment variables (not process env).
     pub env_vars: HashMap<String, String>,
 }
@@ -97,7 +99,16 @@ impl Session {
         cols: u16,
         rows: u16,
         env: Option<std::collections::HashMap<String, String>>,
+        cwd: Option<String>,
     ) -> anyhow::Result<Self> {
+        // Validate cwd if provided.
+        if let Some(ref dir) = cwd {
+            let path = std::path::Path::new(dir);
+            if !path.is_dir() {
+                anyhow::bail!("working directory '{}' does not exist or is not a directory", dir);
+            }
+        }
+
         let winsize = Winsize {
             ws_row: if rows > 0 { rows } else { 24 },
             ws_col: if cols > 0 { cols } else { 80 },
@@ -148,6 +159,9 @@ impl Session {
                 if let Some(ref env_vars) = env {
                     command.envs(env_vars);
                 }
+                if let Some(ref dir) = cwd {
+                    command.current_dir(dir);
+                }
                 let err = command.exec();
                 eprintln!("amux: exec failed: {}", err);
                 std::process::exit(1);
@@ -182,6 +196,8 @@ impl Session {
         let now = std::time::SystemTime::now();
         let last_activity = Arc::new(StdMutex::new(now));
         let last_activity_clone = last_activity.clone();
+        let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+        let exit_code_clone = exit_code.clone();
 
         // Spawn the I/O task (owns the master fd via OwnedFd).
         tokio::spawn(Self::io_loop(
@@ -194,6 +210,7 @@ impl Session {
             resize_rx,
             kill_rx,
             exit_tx,
+            exit_code_clone,
         ));
 
         let session = Session {
@@ -208,6 +225,7 @@ impl Session {
             kill_tx: Some(kill_tx),
             scrollback,
             exit_watch: exit_rx,
+            exit_code,
             env_vars: env.unwrap_or_default(),
         };
 
@@ -224,6 +242,7 @@ impl Session {
         mut resize_rx: mpsc::Receiver<(u16, u16)>,
         mut kill_rx: oneshot::Receiver<()>,
         exit_tx: watch::Sender<bool>,
+        exit_code: Arc<StdMutex<Option<i32>>>,
     ) {
         // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
@@ -352,11 +371,18 @@ impl Session {
             }
         }
 
+        // Wait for child to exit and capture exit code.
+        let code = match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => Some(code),
+            Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => Some(128 + sig as i32),
+            _ => None,
+        };
+        if let Ok(mut ec) = exit_code.lock() {
+            *ec = code;
+        }
+
         // Signal that the io_loop has exited (session is effectively dead).
         let _ = exit_tx.send(true);
-
-        // Wait for child to exit.
-        let _ = nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
     }
 
     pub fn is_alive(&self) -> bool {
@@ -490,5 +516,76 @@ mod tests {
         assert_eq!(clone.len(), 2);
         assert_eq!(clone.get("A"), Some(&"1".to_string()));
         assert_eq!(clone.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_spawn_with_invalid_cwd() {
+        let result = Session::spawn(
+            "cwd-test".to_string(),
+            &["echo".to_string(), "hi".to_string()],
+            80,
+            24,
+            None,
+            Some("/nonexistent/path/that/does/not/exist".to_string()),
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("does not exist"), "error was: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_valid_cwd() {
+        let tmp = std::env::temp_dir();
+        let tmp_str = tmp.to_str().unwrap().to_string();
+        let result = Session::spawn(
+            "cwd-valid-test".to_string(),
+            &["pwd".to_string()],
+            80,
+            24,
+            None,
+            Some(tmp_str),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_no_cwd() {
+        let result = Session::spawn(
+            "cwd-none-test".to_string(),
+            &["echo".to_string(), "hi".to_string()],
+            80,
+            24,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_exit_code_default_none() {
+        let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+        assert_eq!(*exit_code.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn test_exit_code_store_and_retrieve() {
+        let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+        let clone = exit_code.clone();
+
+        // Simulate io_loop storing exit code.
+        *clone.lock().unwrap() = Some(0);
+        assert_eq!(*exit_code.lock().unwrap(), Some(0));
+
+        // Non-zero exit code.
+        *clone.lock().unwrap() = Some(42);
+        assert_eq!(*exit_code.lock().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn test_exit_code_signal() {
+        let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+        // Signal 9 (SIGKILL) → 128 + 9 = 137.
+        *exit_code.lock().unwrap() = Some(137);
+        assert_eq!(*exit_code.lock().unwrap(), Some(137));
     }
 }

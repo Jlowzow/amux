@@ -11,6 +11,7 @@ pub enum ClientMessage {
         name: Option<String>,
         command: Vec<String>,
         env: Option<HashMap<String, String>>,
+        cwd: Option<String>,
     },
     ListSessions,
     /// Get detailed info for a single session.
@@ -62,6 +63,10 @@ pub enum ClientMessage {
         /// Timeout in seconds (0 = wait forever).
         timeout_secs: u64,
     },
+    /// Get the exit code of a (finished) session.
+    GetExitCode {
+        name: String,
+    },
 }
 
 /// Responses from daemon to client.
@@ -96,6 +101,8 @@ pub enum DaemonMessage {
     EnvVars(HashMap<String, String>),
     /// Session exited (response to WaitSession).
     SessionExited,
+    /// Exit code of a session (None if still running or unknown).
+    ExitCode(Option<i32>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

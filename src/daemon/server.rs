@@ -79,9 +79,9 @@ async fn handle_connection(
                 let _ = shutdown.send(());
                 return;
             }
-            ClientMessage::CreateSession { name, command, env } => {
+            ClientMessage::CreateSession { name, command, env, cwd } => {
                 let mut reg = registry.lock().await;
-                match reg.create(name, &command, 80, 24, env) {
+                match reg.create(name, &command, 80, 24, env, cwd) {
                     Ok(name) => {
                         let _ = write_frame_async(
                             &mut writer,
@@ -307,6 +307,20 @@ async fn handle_connection(
                     let _ = write_frame_async(
                         &mut writer,
                         &DaemonMessage::SessionExited,
+                    )
+                    .await;
+                }
+            }
+            ClientMessage::GetExitCode { name } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let code = session.exit_code.lock().ok().and_then(|ec| *ec);
+                    let _ =
+                        write_frame_async(&mut writer, &DaemonMessage::ExitCode(code)).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
                     )
                     .await;
                 }
