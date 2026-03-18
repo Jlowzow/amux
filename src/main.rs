@@ -1669,4 +1669,233 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Integration test: WatchSessions receives exit events for multiple sessions.
+    #[tokio::test]
+    async fn test_watch_sessions_multiple_exits() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("watch-a".to_string()),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("watch-b".to_string()),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // Wait for sessions to exit.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Now watch both sessions (they should already be dead).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WatchSessions {
+                sessions: vec!["watch-a".to_string(), "watch-b".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Collect exit events.
+        let mut events: std::collections::HashMap<String, Option<i32>> =
+            std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::WatchSessionExited { session, exit_code })) => {
+                            events.insert(session, exit_code);
+                        }
+                        Some(Ok(DaemonMessage::WatchDone)) => break,
+                        Some(Ok(other)) => panic!("unexpected message: {:?}", other),
+                        Some(Err(e)) => panic!("read error: {}", e),
+                        None => panic!("disconnected"),
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timeout waiting for watch events, got: {:?}", events);
+                }
+            }
+        }
+
+        assert_eq!(events.len(), 2, "expected 2 exit events, got: {:?}", events);
+        assert_eq!(events.get("watch-a"), Some(&Some(0)));
+        assert_eq!(events.get("watch-b"), Some(&Some(42)));
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WatchSessions waits for live sessions to exit.
+    #[tokio::test]
+    async fn test_watch_sessions_live_then_exit() {
+        use tokio::sync::broadcast;
+
+        let dir =
+            std::env::temp_dir().join(format!("amux-test-watch-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Create a session that sleeps briefly then exits.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("watch-live".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 0.3; exit 7".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // Start watching immediately (session still alive).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WatchSessions {
+                sessions: vec!["watch-live".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Should receive exit event after session finishes.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got_exit = false;
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::WatchSessionExited { session, exit_code })) => {
+                            assert_eq!(session, "watch-live");
+                            assert_eq!(exit_code, Some(7));
+                            got_exit = true;
+                        }
+                        Some(Ok(DaemonMessage::WatchDone)) => {
+                            assert!(got_exit, "got WatchDone before any exit event");
+                            break;
+                        }
+                        Some(Ok(other)) => panic!("unexpected: {:?}", other),
+                        Some(Err(e)) => panic!("read error: {}", e),
+                        None => panic!("disconnected"),
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timeout waiting for watch-live exit event");
+                }
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WatchSessions returns error for nonexistent session.
+    #[tokio::test]
+    async fn test_watch_sessions_not_found() {
+        use tokio::sync::broadcast;
+
+        let dir =
+            std::env::temp_dir().join(format!("amux-test-watch-nf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WatchSessions {
+                sessions: vec!["nonexistent".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::Error(ref e) if e.contains("not found")),
+            "expected Error(not found), got: {:?}",
+            resp
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
