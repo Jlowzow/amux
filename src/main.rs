@@ -221,7 +221,13 @@ fn main() -> anyhow::Result<()> {
             env,
             cmd,
         } => {
+            if std::env::var("AMUX_DEBUG").is_ok() {
+                eprintln!("amux-debug: ensure_daemon_running");
+            }
             ensure_daemon_running()?;
+            if std::env::var("AMUX_DEBUG").is_ok() {
+                eprintln!("amux-debug: daemon running, parsing env");
+            }
             let env_map = parse_env_vars(&env)?;
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
@@ -241,13 +247,21 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 // Create then attach.
+                if std::env::var("AMUX_DEBUG").is_ok() {
+                    eprintln!("amux-debug: creating session (non-detached)");
+                }
                 let resp = client::request(&ClientMessage::CreateSession {
                     name: name.clone(),
                     command: cmd,
                     env: env_map,
                 })?;
                 let session_name = match resp {
-                    DaemonMessage::SessionCreated { name } => name,
+                    DaemonMessage::SessionCreated { name } => {
+                        if std::env::var("AMUX_DEBUG").is_ok() {
+                            eprintln!("amux-debug: session created: '{}', calling do_attach", name);
+                        }
+                        name
+                    }
                     DaemonMessage::Error(e) => {
                         eprintln!("amux: error: {}", e);
                         std::process::exit(1);
@@ -512,17 +526,22 @@ fn ensure_daemon_running() -> anyhow::Result<()> {
 /// Attach to a named session.
 fn do_attach(name: &str) -> anyhow::Result<()> {
     use crate::protocol::codec::write_frame;
+    let debug = std::env::var("AMUX_DEBUG").is_ok();
+
+    if debug { eprintln!("amux-debug: do_attach('{}') start", name); }
 
     // Pre-check: verify session exists before attempting PTY attach.
     let resp = client::request(&ClientMessage::HasSession {
         name: name.to_string(),
     })?;
+    if debug { eprintln!("amux-debug: HasSession response: {:?}", resp); }
     if !matches!(resp, DaemonMessage::SessionExists(true)) {
         eprintln!("amux: session '{}' not found", name);
         std::process::exit(1);
     }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    if debug { eprintln!("amux-debug: terminal size: {}x{}", cols, rows); }
 
     let mut stream =
         client::connect().context("is the server running?")?;
@@ -536,11 +555,13 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
             rows,
         },
     )?;
+    if debug { eprintln!("amux-debug: Attach frame sent"); }
 
     // Switch to async for bidirectional streaming.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    if debug { eprintln!("amux-debug: tokio runtime built"); }
 
     rt.block_on(async {
         let raw_fd = stream.into_raw_fd();
@@ -551,11 +572,13 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
         new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
         nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags))
             .map_err(|e| anyhow::anyhow!("fcntl F_SETFL on socket: {}", e))?;
+        if debug { eprintln!("amux-debug: socket set non-blocking, converting to tokio"); }
         let tokio_stream = unsafe {
             tokio::net::UnixStream::from_std(
                 std::os::unix::net::UnixStream::from_raw_fd(raw_fd),
             )?
         };
+        if debug { eprintln!("amux-debug: tokio stream created, entering run_attach"); }
         let (reader, mut writer) = tokio_stream.into_split();
         client::attach::run_attach(reader, &mut writer).await
     })
@@ -1129,6 +1152,144 @@ mod tests {
         }
 
         // Clean up.
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reproduce the exact do_attach code path: sync write Attach, then convert
+    /// the socket to async and read Output frames. This tests whether the
+    /// sync→async conversion loses data.
+    #[tokio::test]
+    async fn test_attach_sync_write_then_async_read() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Create session on an async connection (like ensure_daemon + client::request).
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::CreateSession {
+                name: Some("sync-attach-test".to_string()),
+                command: vec!["cat".to_string()],
+                env: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        drop(r);
+        drop(w);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Now mimic do_attach: connect with a SYNC std socket, write Attach
+        // synchronously, then convert to async.
+        let std_sock_path = sock_path.clone();
+        let std_stream =
+            std::os::unix::net::UnixStream::connect(&std_sock_path).unwrap();
+
+        // Sync write (exactly like do_attach).
+        let mut sync_stream = std_stream;
+        crate::protocol::codec::write_frame(
+            &mut sync_stream,
+            &ClientMessage::Attach {
+                name: "sync-attach-test".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap();
+
+        // Convert to async (exactly like do_attach).
+        let raw_fd = sync_stream.into_raw_fd();
+        let old_flags = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
+        new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+        nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags)).unwrap();
+        let tokio_stream = unsafe {
+            tokio::net::UnixStream::from_std(
+                std::os::unix::net::UnixStream::from_raw_fd(raw_fd),
+            )
+            .unwrap()
+        };
+        let (mut reader, mut writer) = tokio_stream.into_split();
+
+        // Read — we should get at least one Output frame (scrollback or live output).
+        let mut got_output = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(_data))) => {
+                            got_output = true;
+                            break;
+                        }
+                        Some(Ok(other)) => {
+                            panic!("unexpected message: {:?}", other);
+                        }
+                        Some(Err(e)) => {
+                            panic!("read error: {}", e);
+                        }
+                        None => {
+                            panic!("disconnected before receiving Output");
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+
+        // Send some input to generate output if scrollback was empty.
+        if !got_output {
+            write_frame_async(
+                &mut writer,
+                &ClientMessage::AttachInput(b"hello\n".to_vec()),
+            )
+            .await
+            .unwrap();
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                tokio::select! {
+                    msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                        match msg {
+                            Some(Ok(DaemonMessage::Output(_))) => {
+                                got_output = true;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(got_output, "sync write → async read: never received Output from server");
+
+        let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
     }

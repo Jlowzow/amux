@@ -55,6 +55,16 @@ src/
 4. **Add CLI variant** to the `Command` enum in `src/main.rs`
 5. **Add dispatch** in `main()` match arm — typically calls `client::request()`
 
+## Development Process
+
+Use TDD (Test-Driven Development) for all changes:
+
+1. **Red** — Write a failing test that defines the desired behavior
+2. **Green** — Write the minimum code to make the test pass
+3. **Refactor** — Clean up while keeping tests green
+
+Run `cargo test` after each step to confirm state. Tests go in the same file as the code they test (inline `#[cfg(test)]` modules), following existing convention.
+
 ## Architecture Notes
 
 - Daemon forks before creating tokio runtime (fork safety)

@@ -331,7 +331,7 @@ async fn handle_attach(
     rows: u16,
 ) {
     // Get session handles (brief lock, no scrollback mutation needed).
-    let (input_tx, mut output_rx, resize_tx, scrollback_data) = {
+    let (input_tx, mut output_rx, resize_tx, mut exit_rx, scrollback_data) = {
         let reg = registry.lock().await;
         let session = match reg.get(name) {
             Some(s) => s,
@@ -348,6 +348,7 @@ async fn handle_attach(
         let input_tx = session.input_tx.clone();
         let output_rx = session.output_tx.subscribe();
         let resize_tx = session.resize_tx.clone();
+        let exit_rx = session.exit_watch.clone();
         // Read scrollback from the session's Arc (short std::sync::Mutex lock).
         let scrollback = session
             .scrollback
@@ -355,7 +356,7 @@ async fn handle_attach(
             .map(|sb| sb.contents())
             .unwrap_or_default();
 
-        (input_tx, output_rx, resize_tx, scrollback)
+        (input_tx, output_rx, resize_tx, exit_rx, scrollback)
     };
 
     // Resize to client's terminal size (outside registry lock).
@@ -408,6 +409,15 @@ async fn handle_attach(
                         let _ = write_frame_async(&mut writer, &DaemonMessage::SessionEnded).await;
                         break;
                     }
+                }
+            }
+            // Session io_loop exited → notify client immediately.
+            // The broadcast channel won't close until the Session struct is
+            // dropped (by the reaper), so we watch exit_rx to avoid a 30s hang.
+            _ = exit_rx.changed() => {
+                if *exit_rx.borrow() {
+                    let _ = write_frame_async(&mut writer, &DaemonMessage::SessionEnded).await;
+                    break;
                 }
             }
             // Input from client → PTY (via cancel-safe channel).

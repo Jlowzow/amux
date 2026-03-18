@@ -26,8 +26,12 @@ pub async fn run_attach(
     reader: tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<()> {
+    let debug = std::env::var("AMUX_DEBUG").is_ok();
+
     // Enable raw mode.
+    if debug { eprintln!("\r\namux-debug: enabling raw mode"); }
     terminal::enable_raw_mode()?;
+    if debug { eprintln!("\r\namux-debug: raw mode enabled"); }
 
     // Set stdin to non-blocking for async reads.
     let stdin_fd = libc::STDIN_FILENO;
@@ -37,13 +41,19 @@ pub async fn run_attach(
     new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
     nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags))
         .map_err(|e| anyhow::anyhow!("fcntl F_SETFL: {}", e))?;
+    if debug { eprintln!("\r\namux-debug: stdin set non-blocking"); }
 
     let result = attach_loop(reader, writer).await;
+    if debug { eprintln!("\r\namux-debug: attach_loop returned: {:?}", result.as_ref().map(|_| "ok")); }
 
     // Restore stdin to blocking mode and terminal to cooked mode.
     let restore_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
     let _ = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(restore_flags));
     terminal::disable_raw_mode()?;
+
+    // Ensure stdout ends with a newline so the outer shell doesn't show
+    // a partial-line indicator (e.g. zsh's '%' mark).
+    let _ = std::io::stdout().write_all(b"\n");
 
     result
 }
@@ -64,7 +74,10 @@ async fn attach_loop(
     mut reader: tokio::net::unix::OwnedReadHalf,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> anyhow::Result<()> {
+    let debug = std::env::var("AMUX_DEBUG").is_ok();
+    if debug { eprintln!("\r\namux-debug: creating AsyncFd for stdin"); }
     let async_stdin = AsyncFd::new(NonOwningFd(libc::STDIN_FILENO))?;
+    if debug { eprintln!("\r\namux-debug: AsyncFd created, setting up sigwinch"); }
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     // Spawn a dedicated reader task for daemon messages.
@@ -105,6 +118,8 @@ async fn attach_loop(
         }
     });
 
+    if debug { eprintln!("\r\namux-debug: entering select loop"); }
+
     let mut prefix_pending = false;
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 4096];
@@ -115,6 +130,7 @@ async fn attach_loop(
             msg = daemon_msg_rx.recv() => {
                 match msg {
                     Some(DaemonEvent::Output(data)) => {
+                        if debug { eprintln!("\r\namux-debug: got Output ({} bytes)", data.len()); }
                         stdout.write_all(&data)?;
                         stdout.flush()?;
                     }
@@ -154,7 +170,10 @@ async fn attach_loop(
                         Ok(n as usize)
                     }
                 }) {
-                    Ok(Ok(0)) => break Ok(()), // EOF
+                    Ok(Ok(0)) => {
+                        if debug { eprintln!("\r\namux-debug: stdin EOF — exiting attach"); }
+                        break Ok(());
+                    }
                     Ok(Ok(n)) => {
                         let data = &buf[..n];
                         if std::env::var("AMUX_DEBUG").is_ok() {
