@@ -3,6 +3,8 @@ mod common;
 mod daemon;
 mod protocol;
 
+use std::collections::HashMap;
+
 use clap::{Parser, Subcommand};
 
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
@@ -30,6 +32,9 @@ enum Command {
         /// Working directory for the session
         #[arg(short = 'c', long = "cwd")]
         cwd: Option<String>,
+        /// Create a git worktree and run the session in it
+        #[arg(short = 'w', long = "worktree")]
+        worktree: Option<String>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -182,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             detached: false,
             env: Vec::new(),
             cwd: None,
+            worktree: None,
             cmd: vec![shell],
         }
     });
@@ -245,6 +251,7 @@ fn main() -> anyhow::Result<()> {
             detached,
             env,
             cwd,
+            worktree,
             cmd,
         } => {
             if std::env::var("AMUX_DEBUG").is_ok() {
@@ -254,7 +261,18 @@ fn main() -> anyhow::Result<()> {
             if std::env::var("AMUX_DEBUG").is_ok() {
                 eprintln!("amux-debug: daemon running, parsing env");
             }
-            let env_map = parse_env_vars(&env)?;
+            let mut env_map = parse_env_vars(&env)?;
+
+            // Handle --worktree: create a git worktree, set cwd to it, store metadata.
+            let cwd = if let Some(ref branch) = worktree {
+                let worktree_path = create_git_worktree(branch)?;
+                let env = env_map.get_or_insert_with(HashMap::new);
+                env.insert("AMUX_WORKTREE_PATH".to_string(), worktree_path.clone());
+                env.insert("AMUX_WORKTREE_BRANCH".to_string(), branch.clone());
+                Some(worktree_path)
+            } else {
+                cwd
+            };
             if detached {
                 let resp = client::request(&ClientMessage::CreateSession {
                     name,
@@ -927,13 +945,62 @@ fn strip_ansi(input: &[u8]) -> Vec<u8> {
 }
 
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
+/// Create a git worktree for the given branch name.
+/// Returns the absolute path to the new worktree directory.
+fn create_git_worktree(branch: &str) -> anyhow::Result<String> {
+    // Get the git toplevel to derive a worktree path.
+    let toplevel = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !toplevel.status.success() {
+        anyhow::bail!(
+            "not a git repository (git rev-parse --show-toplevel failed)"
+        );
+    }
+    let repo_root = String::from_utf8(toplevel.stdout)?.trim().to_string();
+
+    // Place worktrees in a sibling directory: <repo>-<branch>
+    let repo_name = std::path::Path::new(&repo_root)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let parent = std::path::Path::new(&repo_root)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"));
+    let worktree_path = parent.join(format!("{}-{}", repo_name, branch));
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", &worktree_str, "-b", branch])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git worktree add failed: {}", stderr.trim());
+    }
+
+    eprintln!("amux: created worktree at {}", worktree_str);
+    Ok(worktree_str)
+}
+
+/// Remove a git worktree directory.
+fn remove_git_worktree(worktree_path: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_path])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git worktree remove failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 fn parse_env_vars(
     vars: &[String],
-) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
+) -> anyhow::Result<Option<HashMap<String, String>>> {
     if vars.is_empty() {
         return Ok(None);
     }
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
     for var in vars {
         let (key, value) = var
             .split_once('=')
