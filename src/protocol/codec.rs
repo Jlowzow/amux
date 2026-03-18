@@ -229,6 +229,7 @@ mod tests {
                 uptime_secs: 60,
                 last_activity: "2026-02-20T12:00:30Z".to_string(),
                 idle_secs: 30,
+                exit_code: None,
             },
             SessionInfo {
                 name: "s2".to_string(),
@@ -239,6 +240,7 @@ mod tests {
                 uptime_secs: 3660,
                 last_activity: "2026-02-20T11:30:00Z".to_string(),
                 idle_secs: 1860,
+                exit_code: Some(1),
             },
         ]);
         let mut buf = Vec::new();

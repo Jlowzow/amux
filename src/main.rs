@@ -327,7 +327,14 @@ fn main() -> anyhow::Result<()> {
                         eprintln!("no sessions");
                     } else {
                         for s in &sessions {
-                            let status = if s.alive { "" } else { " (dead)" };
+                            let status = if s.alive {
+                                String::new()
+                            } else {
+                                match s.exit_code {
+                                    Some(code) => format!(" (exited({}))", code),
+                                    None => " (dead)".to_string(),
+                                }
+                            };
                             println!(
                                 "{}: {} (pid {}, up {}s, idle {}s, created {}){}", s.name, s.command, s.pid, s.uptime_secs, s.idle_secs, s.created_at, status
                             );
@@ -355,7 +362,14 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
                         );
                     } else {
-                        let status = if info.alive { "alive" } else { "dead" };
+                        let status = if info.alive {
+                            "alive".to_string()
+                        } else {
+                            match info.exit_code {
+                                Some(code) => format!("exited({})", code),
+                                None => "dead".to_string(),
+                            }
+                        };
                         println!("name: {}", info.name);
                         println!("command: {}", info.command);
                         println!("pid: {}", info.pid);
@@ -1894,6 +1908,157 @@ mod tests {
             "expected Error(not found), got: {:?}",
             resp
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: SessionInfo includes exit_code for exited sessions.
+    #[tokio::test]
+    async fn test_ls_shows_exit_code() {
+        use tokio::sync::broadcast;
+
+        let dir =
+            std::env::temp_dir().join(format!("amux-test-ls-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Create a session that exits with code 42.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("exit-test".to_string()),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::SessionCreated { ref name } if name == "exit-test"),
+            "expected SessionCreated, got: {:?}",
+            resp
+        );
+
+        // Wait for the session to exit.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // List sessions and verify exit_code is present.
+        write_frame_async(&mut writer, &ClientMessage::ListSessions)
+            .await
+            .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::SessionList(sessions) => {
+                let session = sessions
+                    .iter()
+                    .find(|s| s.name == "exit-test")
+                    .expect("exit-test session not found in listing");
+                assert!(!session.alive, "session should be dead");
+                assert_eq!(
+                    session.exit_code,
+                    Some(42),
+                    "expected exit_code=Some(42), got {:?}",
+                    session.exit_code
+                );
+            }
+            other => panic!("expected SessionList, got: {:?}", other),
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: SessionInfo exit_code is None for running sessions.
+    #[tokio::test]
+    async fn test_ls_exit_code_none_for_alive() {
+        use tokio::sync::broadcast;
+
+        let dir =
+            std::env::temp_dir().join(format!("amux-test-ls-alive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Create a long-running session.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("alive-test".to_string()),
+                command: vec!["sleep".to_string(), "60".to_string()],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // List sessions — alive session should have exit_code=None.
+        write_frame_async(&mut writer, &ClientMessage::ListSessions)
+            .await
+            .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::SessionList(sessions) => {
+                let session = sessions
+                    .iter()
+                    .find(|s| s.name == "alive-test")
+                    .expect("alive-test session not found");
+                assert!(session.alive, "session should be alive");
+                assert_eq!(session.exit_code, None, "alive session should have no exit code");
+            }
+            other => panic!("expected SessionList, got: {:?}", other),
+        }
+
+        // Kill the session to clean up.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::KillSession {
+                name: "alive-test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = try_read_frame_async::<DaemonMessage>(&mut reader).await;
 
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);

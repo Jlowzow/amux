@@ -27,6 +27,8 @@ pub struct Session {
     pub exit_watch: watch::Receiver<bool>,
     /// Child process exit code, set by io_loop after waitpid.
     pub exit_code: Arc<StdMutex<Option<i32>>>,
+    /// Timestamp when the session was detected as dead (for reaper retention).
+    pub died_at: Arc<StdMutex<Option<std::time::SystemTime>>>,
     /// Session-level metadata environment variables (not process env).
     pub env_vars: HashMap<String, String>,
 }
@@ -198,6 +200,8 @@ impl Session {
         let last_activity_clone = last_activity.clone();
         let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
         let exit_code_clone = exit_code.clone();
+        let died_at: Arc<StdMutex<Option<std::time::SystemTime>>> = Arc::new(StdMutex::new(None));
+        let died_at_clone = died_at.clone();
 
         // Spawn the I/O task (owns the master fd via OwnedFd).
         tokio::spawn(Self::io_loop(
@@ -211,6 +215,7 @@ impl Session {
             kill_rx,
             exit_tx,
             exit_code_clone,
+            died_at_clone,
         ));
 
         let session = Session {
@@ -226,6 +231,7 @@ impl Session {
             scrollback,
             exit_watch: exit_rx,
             exit_code,
+            died_at,
             env_vars: env.unwrap_or_default(),
         };
 
@@ -243,6 +249,7 @@ impl Session {
         mut kill_rx: oneshot::Receiver<()>,
         exit_tx: watch::Sender<bool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
+        died_at: Arc<StdMutex<Option<std::time::SystemTime>>>,
     ) {
         // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
@@ -379,6 +386,9 @@ impl Session {
         };
         if let Ok(mut ec) = exit_code.lock() {
             *ec = code;
+        }
+        if let Ok(mut da) = died_at.lock() {
+            *da = Some(std::time::SystemTime::now());
         }
 
         // Signal that the io_loop has exited (session is effectively dead).

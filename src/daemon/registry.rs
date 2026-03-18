@@ -85,6 +85,7 @@ impl Registry {
             .unwrap_or_default()
             .as_secs();
         let last_activity = format_system_time(last_activity_time);
+        let exit_code = s.exit_code.lock().ok().and_then(|ec| *ec);
         SessionInfo {
             name: s.name.clone(),
             command: s.command.clone(),
@@ -94,6 +95,7 @@ impl Registry {
             uptime_secs,
             last_activity,
             idle_secs,
+            exit_code,
         }
     }
 
@@ -148,12 +150,24 @@ impl Registry {
         self.sessions.get_mut(name)
     }
 
-    /// Remove dead sessions (reaper).
+    /// Remove dead sessions that have been dead for longer than the retention period.
+    /// Dead sessions are kept for 5 minutes so their exit codes remain visible in `ls`.
     pub fn reap_dead(&mut self) -> Vec<String> {
+        let now = std::time::SystemTime::now();
+        let retention = std::time::Duration::from_secs(300); // 5 minutes
         let dead: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| !s.is_alive())
+            .filter(|(_, s)| {
+                if s.is_alive() {
+                    return false;
+                }
+                // Only reap if died_at is set and older than retention period.
+                match s.died_at.lock().ok().and_then(|da| *da) {
+                    Some(died) => now.duration_since(died).unwrap_or_default() > retention,
+                    None => false, // Keep if died_at not yet set (race with io_loop).
+                }
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for name in &dead {
