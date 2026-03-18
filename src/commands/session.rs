@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
-use crate::util::{create_git_worktree, ensure_daemon_running, parse_env_vars, strip_ansi};
+use crate::util::{clean_control_chars, create_git_worktree, ensure_daemon_running, parse_env_vars, strip_ansi};
 use crate::client;
 
 use super::attach::do_attach;
@@ -162,7 +162,11 @@ pub fn capture_scrollback(name: &str, lines: usize, plain: bool) -> anyhow::Resu
     match resp {
         DaemonMessage::CaptureOutput(data) => {
             use std::io::Write;
-            let output = if plain { strip_ansi(&data) } else { data };
+            let output = if plain {
+                clean_control_chars(&strip_ansi(&data))
+            } else {
+                data
+            };
             std::io::stdout().write_all(&output)?;
         }
         DaemonMessage::Error(e) => {

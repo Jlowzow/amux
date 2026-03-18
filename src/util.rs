@@ -58,6 +58,92 @@ pub(crate) fn strip_ansi(input: &[u8]) -> Vec<u8> {
     output
 }
 
+/// Process raw terminal output for clean plain-text rendering.
+/// Handles: \r\n → \n normalization, bare \r (line overwrite), \x08 (backspace),
+/// strips other control chars (except \n, \t), ensures trailing newline.
+pub(crate) fn clean_control_chars(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<Vec<u8>> = vec![Vec::new()];
+
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        match b {
+            b'\r' => {
+                if i + 1 < input.len() && input[i + 1] == b'\n' {
+                    lines.push(Vec::new());
+                    i += 2;
+                } else {
+                    let saved = std::mem::take(lines.last_mut().unwrap());
+                    let mut cursor = 0usize;
+                    let mut merged = saved;
+                    i += 1;
+                    while i < input.len() {
+                        let c = input[i];
+                        if c == b'\r' || c == b'\n' {
+                            break;
+                        }
+                        if c == 0x08 {
+                            if cursor > 0 {
+                                cursor -= 1;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        if c < 0x20 && c != b'\t' {
+                            i += 1;
+                            continue;
+                        }
+                        if cursor < merged.len() {
+                            merged[cursor] = c;
+                        } else {
+                            merged.push(c);
+                        }
+                        cursor += 1;
+                        i += 1;
+                    }
+                    *lines.last_mut().unwrap() = merged;
+                }
+            }
+            b'\n' => {
+                lines.push(Vec::new());
+                i += 1;
+            }
+            0x08 => {
+                lines.last_mut().unwrap().pop();
+                i += 1;
+            }
+            0x07 => {
+                i += 1;
+            }
+            c if c < 0x20 && c != b'\t' => {
+                i += 1;
+            }
+            _ => {
+                lines.last_mut().unwrap().push(b);
+                i += 1;
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        output.extend_from_slice(line);
+        if idx < lines.len() - 1 {
+            output.push(b'\n');
+        }
+    }
+
+    if !output.is_empty() && !output.ends_with(b"\n") {
+        output.push(b'\n');
+    }
+
+    output
+}
+
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
 pub(crate) fn parse_env_vars(
     vars: &[String],
@@ -140,7 +226,7 @@ pub(crate) fn ensure_daemon_running() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{strip_ansi, clean_control_chars};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -196,5 +282,42 @@ mod tests {
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("ALIVE"));
         assert!(!result.contains(&0x1b));
+    }
+
+    #[test]
+    fn test_clean_control_chars_normalizes_crlf() {
+        assert_eq!(clean_control_chars(b"hello\r\nworld\r\n"), b"hello\nworld\n");
+    }
+
+    #[test]
+    fn test_clean_control_chars_bare_cr_overwrites() {
+        assert_eq!(clean_control_chars(b"abcde\rXY"), b"XYcde\n");
+    }
+
+    #[test]
+    fn test_clean_control_chars_strips_non_printable() {
+        let input = b"hello\x07world\x08!";
+        assert_eq!(clean_control_chars(input), b"helloworl!\n");
+    }
+
+    #[test]
+    fn test_clean_control_chars_backspace() {
+        assert_eq!(clean_control_chars(b"abc\x08\x08XY"), b"aXY\n");
+    }
+
+    #[test]
+    fn test_clean_control_chars_ensures_trailing_newline() {
+        assert_eq!(clean_control_chars(b"hello"), b"hello\n");
+        assert_eq!(clean_control_chars(b"hello\n"), b"hello\n");
+    }
+
+    #[test]
+    fn test_clean_control_chars_empty() {
+        assert_eq!(clean_control_chars(b""), b"");
+    }
+
+    #[test]
+    fn test_clean_control_chars_preserves_tabs() {
+        assert_eq!(clean_control_chars(b"a\tb\n"), b"a\tb\n");
     }
 }

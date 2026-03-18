@@ -16,9 +16,7 @@ pub fn list_sessions(json: bool) -> anyhow::Result<()> {
                     serde_json::to_string(&sessions)
                         .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
                 );
-            } else if sessions.is_empty() {
-                eprintln!("no sessions");
-            } else {
+            } else if !sessions.is_empty() {
                 for s in &sessions {
                     let status = if s.alive {
                         String::new()
