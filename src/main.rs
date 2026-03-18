@@ -64,9 +64,12 @@ enum Command {
     },
     /// Wait for a session to exit
     Wait {
-        /// Target session name
-        #[arg(short = 't', long = "target")]
-        name: String,
+        /// Target session name (single session mode)
+        #[arg(short = 't', long = "target", required_unless_present = "any")]
+        name: Option<String>,
+        /// Wait for any of the given sessions to exit
+        #[arg(long, num_args = 1.., value_name = "SESSION")]
+        any: Vec<String>,
         /// Timeout in seconds (0 = wait forever)
         #[arg(long, default_value = "0")]
         timeout: u64,
@@ -375,45 +378,82 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Wait {
             name,
+            any,
             timeout,
             exit_code,
         } => {
             ensure_daemon_running()?;
-            let resp = client::request(&ClientMessage::WaitSession {
-                name: name.clone(),
-                timeout_secs: timeout,
-            })?;
-            match resp {
-                DaemonMessage::SessionExited => {
-                    if exit_code {
-                        let resp =
-                            client::request(&ClientMessage::GetExitCode { name: name.clone() })?;
-                        match resp {
-                            DaemonMessage::ExitCode(Some(code)) => {
-                                println!("{}", code);
-                                std::process::exit(code);
+            if !any.is_empty() {
+                // --any mode: wait for any of the listed sessions to exit.
+                let resp = client::request(&ClientMessage::WaitAny {
+                    sessions: any,
+                    timeout_secs: timeout,
+                })?;
+                match resp {
+                    DaemonMessage::WaitAnyExited {
+                        session,
+                        exit_code: code,
+                    } => {
+                        println!("{}", session);
+                        if exit_code {
+                            if let Some(c) = code {
+                                std::process::exit(c);
                             }
-                            DaemonMessage::ExitCode(None) => {
-                                eprintln!("amux: exit code unavailable for session '{}'", name);
-                                std::process::exit(1);
-                            }
-                            DaemonMessage::Error(e) => {
-                                eprintln!("amux: error: {}", e);
-                                std::process::exit(1);
-                            }
-                            other => eprintln!("amux: unexpected: {:?}", other),
                         }
                     }
-                }
-                DaemonMessage::Error(e) => {
-                    if e == "timeout" {
-                        eprintln!("amux: wait timed out for session '{}'", name);
-                        std::process::exit(2);
+                    DaemonMessage::Error(e) => {
+                        if e == "timeout" {
+                            eprintln!("amux: wait --any timed out");
+                            std::process::exit(2);
+                        }
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
                     }
-                    eprintln!("amux: error: {}", e);
-                    std::process::exit(1);
+                    other => eprintln!("amux: unexpected: {:?}", other),
                 }
-                other => eprintln!("amux: unexpected: {:?}", other),
+            } else {
+                // Single session mode (existing behavior).
+                let name = name.unwrap();
+                let resp = client::request(&ClientMessage::WaitSession {
+                    name: name.clone(),
+                    timeout_secs: timeout,
+                })?;
+                match resp {
+                    DaemonMessage::SessionExited => {
+                        if exit_code {
+                            let resp = client::request(&ClientMessage::GetExitCode {
+                                name: name.clone(),
+                            })?;
+                            match resp {
+                                DaemonMessage::ExitCode(Some(code)) => {
+                                    println!("{}", code);
+                                    std::process::exit(code);
+                                }
+                                DaemonMessage::ExitCode(None) => {
+                                    eprintln!(
+                                        "amux: exit code unavailable for session '{}'",
+                                        name
+                                    );
+                                    std::process::exit(1);
+                                }
+                                DaemonMessage::Error(e) => {
+                                    eprintln!("amux: error: {}", e);
+                                    std::process::exit(1);
+                                }
+                                other => eprintln!("amux: unexpected: {:?}", other),
+                            }
+                        }
+                    }
+                    DaemonMessage::Error(e) => {
+                        if e == "timeout" {
+                            eprintln!("amux: wait timed out for session '{}'", name);
+                            std::process::exit(2);
+                        }
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
             }
         }
         Command::Watch { sessions, json } => {
@@ -1883,6 +1923,316 @@ mod tests {
             &mut writer,
             &ClientMessage::WatchSessions {
                 sessions: vec!["nonexistent".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::Error(ref e) if e.contains("not found")),
+            "expected Error(not found), got: {:?}",
+            resp
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WaitAny returns when the first session exits.
+    #[tokio::test]
+    async fn test_wait_any_returns_first_exit() {
+        use tokio::sync::broadcast;
+
+        let dir =
+            std::env::temp_dir().join(format!("amux-test-waitany-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Create a fast session (exits quickly) and a slow session (sleeps longer).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wa-fast".to_string()),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wa-slow".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // Wait briefly for fast session to die.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // WaitAny should return immediately (wa-fast is already dead).
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WaitAny {
+                sessions: vec!["wa-fast".to_string(), "wa-slow".to_string()],
+                timeout_secs: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::select! {
+            msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                match msg {
+                    Some(Ok(DaemonMessage::WaitAnyExited { session, exit_code })) => {
+                        assert_eq!(session, "wa-fast");
+                        assert_eq!(exit_code, Some(3));
+                    }
+                    other => panic!("expected WaitAnyExited, got: {:?}", other),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timeout waiting for WaitAny response");
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WaitAny waits for a live session to exit.
+    #[tokio::test]
+    async fn test_wait_any_live_session() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir()
+            .join(format!("amux-test-waitany-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Create two sessions: one exits after 0.3s, the other sleeps long.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wal-quick".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 0.3; exit 11".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wal-long".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // WaitAny while both are alive — should return when wal-quick exits.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WaitAny {
+                sessions: vec!["wal-quick".to_string(), "wal-long".to_string()],
+                timeout_secs: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::select! {
+            msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                match msg {
+                    Some(Ok(DaemonMessage::WaitAnyExited { session, exit_code })) => {
+                        assert_eq!(session, "wal-quick");
+                        assert_eq!(exit_code, Some(11));
+                    }
+                    other => panic!("expected WaitAnyExited, got: {:?}", other),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timeout waiting for WaitAny response");
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WaitAny times out when no session exits.
+    #[tokio::test]
+    async fn test_wait_any_timeout() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir()
+            .join(format!("amux-test-waitany-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::CreateSession {
+                name: Some("wato-long".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 30".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut reader).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+
+        // WaitAny with 1-second timeout — should timeout since session sleeps 30s.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WaitAny {
+                sessions: vec!["wato-long".to_string()],
+                timeout_secs: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::select! {
+            msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                match msg {
+                    Some(Ok(DaemonMessage::Error(e))) => {
+                        assert_eq!(e, "timeout");
+                    }
+                    other => panic!("expected Error(timeout), got: {:?}", other),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timeout waiting for WaitAny timeout response");
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Integration test: WaitAny returns error for nonexistent session.
+    #[tokio::test]
+    async fn test_wait_any_not_found() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir()
+            .join(format!("amux-test-waitany-nf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::WaitAny {
+                sessions: vec!["nonexistent".to_string()],
+                timeout_secs: 0,
             },
         )
         .await

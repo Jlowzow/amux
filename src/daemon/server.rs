@@ -335,6 +335,12 @@ async fn handle_connection(
                 handle_watch(writer, registry.clone(), sessions).await;
                 return;
             }
+            ClientMessage::WaitAny {
+                sessions,
+                timeout_secs,
+            } => {
+                handle_wait_any(&mut writer, registry.clone(), sessions, timeout_secs).await;
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,
@@ -677,4 +683,122 @@ async fn handle_watch(
 
     // All sessions have exited.
     let _ = write_frame_async(&mut writer, &DaemonMessage::WatchDone).await;
+}
+
+/// Handle WaitAny: block until the first of the given sessions exits, or timeout.
+async fn handle_wait_any(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    registry: std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::Registry>>,
+    sessions: Vec<String>,
+    timeout_secs: u64,
+) {
+    use std::collections::HashMap;
+    use tokio::sync::watch;
+
+    if sessions.is_empty() {
+        let _ = write_frame_async(
+            writer,
+            &DaemonMessage::Error("no sessions specified".to_string()),
+        )
+        .await;
+        return;
+    }
+
+    // Check sessions and collect watchers. If any session is already dead, return it immediately.
+    let mut watchers: HashMap<String, (watch::Receiver<bool>, std::sync::Arc<std::sync::Mutex<Option<i32>>>)> =
+        HashMap::new();
+
+    {
+        let reg = registry.lock().await;
+        for name in &sessions {
+            match reg.get(name) {
+                Some(session) => {
+                    if !session.is_alive() {
+                        // Already dead — return immediately.
+                        let code = session.exit_code.lock().ok().and_then(|ec| *ec);
+                        let _ = write_frame_async(
+                            writer,
+                            &DaemonMessage::WaitAnyExited {
+                                session: name.clone(),
+                                exit_code: code,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    watchers.insert(
+                        name.clone(),
+                        (session.exit_watch.clone(), session.exit_code.clone()),
+                    );
+                }
+                None => {
+                    let _ = write_frame_async(
+                        writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // All sessions are alive — race them with a JoinSet.
+    let wait_fut = async {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (name, (rx, _)) in &watchers {
+            let name = name.clone();
+            let mut rx = rx.clone();
+            join_set.spawn(async move {
+                loop {
+                    if rx.changed().await.is_err() {
+                        return name;
+                    }
+                    if *rx.borrow() {
+                        return name;
+                    }
+                }
+            });
+        }
+        match join_set.join_next().await {
+            Some(Ok(name)) => {
+                join_set.abort_all();
+                name
+            }
+            _ => String::new(), // Shouldn't happen.
+        }
+    };
+
+    let result = if timeout_secs > 0 {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), wait_fut).await {
+            Ok(name) => Some(name),
+            Err(_) => None,
+        }
+    } else {
+        Some(wait_fut.await)
+    };
+
+    match result {
+        Some(name) if !name.is_empty() => {
+            let exit_code = watchers
+                .get(&name)
+                .and_then(|(_, ec)| ec.lock().ok().and_then(|ec| *ec));
+            let _ = write_frame_async(
+                writer,
+                &DaemonMessage::WaitAnyExited {
+                    session: name,
+                    exit_code,
+                },
+            )
+            .await;
+        }
+        None => {
+            let _ = write_frame_async(
+                writer,
+                &DaemonMessage::Error("timeout".to_string()),
+            )
+            .await;
+        }
+        _ => {} // Empty name — shouldn't happen.
+    }
 }
