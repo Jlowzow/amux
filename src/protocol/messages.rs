@@ -136,4 +136,6 @@ pub struct SessionInfo {
     pub last_activity: String,
     /// Seconds since last PTY output activity.
     pub idle_secs: u64,
+    /// Exit code of the session process (None if still running).
+    pub exit_code: Option<i32>,
 }
