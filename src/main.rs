@@ -64,9 +64,12 @@ enum Command {
     },
     /// Wait for a session to exit
     Wait {
-        /// Target session name
-        #[arg(short = 't', long = "target")]
-        name: String,
+        /// Target session name (single session mode)
+        #[arg(short = 't', long = "target", required_unless_present = "any")]
+        name: Option<String>,
+        /// Wait for any of the given sessions to exit
+        #[arg(long, num_args = 1.., value_name = "SESSION")]
+        any: Vec<String>,
         /// Timeout in seconds (0 = wait forever)
         #[arg(long, default_value = "0")]
         timeout: u64,
@@ -389,45 +392,82 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Wait {
             name,
+            any,
             timeout,
             exit_code,
         } => {
             ensure_daemon_running()?;
-            let resp = client::request(&ClientMessage::WaitSession {
-                name: name.clone(),
-                timeout_secs: timeout,
-            })?;
-            match resp {
-                DaemonMessage::SessionExited => {
-                    if exit_code {
-                        let resp =
-                            client::request(&ClientMessage::GetExitCode { name: name.clone() })?;
-                        match resp {
-                            DaemonMessage::ExitCode(Some(code)) => {
-                                println!("{}", code);
-                                std::process::exit(code);
+            if !any.is_empty() {
+                // --any mode: wait for any of the listed sessions to exit.
+                let resp = client::request(&ClientMessage::WaitAny {
+                    sessions: any,
+                    timeout_secs: timeout,
+                })?;
+                match resp {
+                    DaemonMessage::WaitAnyExited {
+                        session,
+                        exit_code: code,
+                    } => {
+                        println!("{}", session);
+                        if exit_code {
+                            if let Some(c) = code {
+                                std::process::exit(c);
                             }
-                            DaemonMessage::ExitCode(None) => {
-                                eprintln!("amux: exit code unavailable for session '{}'", name);
-                                std::process::exit(1);
-                            }
-                            DaemonMessage::Error(e) => {
-                                eprintln!("amux: error: {}", e);
-                                std::process::exit(1);
-                            }
-                            other => eprintln!("amux: unexpected: {:?}", other),
                         }
                     }
-                }
-                DaemonMessage::Error(e) => {
-                    if e == "timeout" {
-                        eprintln!("amux: wait timed out for session '{}'", name);
-                        std::process::exit(2);
+                    DaemonMessage::Error(e) => {
+                        if e == "timeout" {
+                            eprintln!("amux: wait --any timed out");
+                            std::process::exit(2);
+                        }
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
                     }
-                    eprintln!("amux: error: {}", e);
-                    std::process::exit(1);
+                    other => eprintln!("amux: unexpected: {:?}", other),
                 }
-                other => eprintln!("amux: unexpected: {:?}", other),
+            } else {
+                // Single session mode (existing behavior).
+                let name = name.unwrap();
+                let resp = client::request(&ClientMessage::WaitSession {
+                    name: name.clone(),
+                    timeout_secs: timeout,
+                })?;
+                match resp {
+                    DaemonMessage::SessionExited => {
+                        if exit_code {
+                            let resp = client::request(&ClientMessage::GetExitCode {
+                                name: name.clone(),
+                            })?;
+                            match resp {
+                                DaemonMessage::ExitCode(Some(code)) => {
+                                    println!("{}", code);
+                                    std::process::exit(code);
+                                }
+                                DaemonMessage::ExitCode(None) => {
+                                    eprintln!(
+                                        "amux: exit code unavailable for session '{}'",
+                                        name
+                                    );
+                                    std::process::exit(1);
+                                }
+                                DaemonMessage::Error(e) => {
+                                    eprintln!("amux: error: {}", e);
+                                    std::process::exit(1);
+                                }
+                                other => eprintln!("amux: unexpected: {:?}", other),
+                            }
+                        }
+                    }
+                    DaemonMessage::Error(e) => {
+                        if e == "timeout" {
+                            eprintln!("amux: wait timed out for session '{}'", name);
+                            std::process::exit(2);
+                        }
+                        eprintln!("amux: error: {}", e);
+                        std::process::exit(1);
+                    }
+                    other => eprintln!("amux: unexpected: {:?}", other),
+                }
             }
         }
         Command::Watch { sessions, json } => {

@@ -77,6 +77,12 @@ pub enum ClientMessage {
     WatchSessions {
         sessions: Vec<String>,
     },
+    /// Block until any of the given sessions exits (or timeout).
+    WaitAny {
+        sessions: Vec<String>,
+        /// Timeout in seconds (0 = wait forever).
+        timeout_secs: u64,
+    },
 }
 
 /// Responses from daemon to client.
@@ -120,6 +126,11 @@ pub enum DaemonMessage {
     },
     /// All watched sessions have exited.
     WatchDone,
+    /// A session exited (response to WaitAny).
+    WaitAnyExited {
+        session: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
