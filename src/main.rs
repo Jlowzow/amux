@@ -18,8 +18,8 @@ struct Cli {
 enum Command {
     /// Create a new session
     New {
-        /// Target session name
-        #[arg(short = 't', long = "target")]
+        /// Session name (human-readable identifier)
+        #[arg(short = 'n', long = "name", visible_alias = "target", short_alias = 't')]
         name: Option<String>,
         /// Start detached (don't attach after creation)
         #[arg(short, long)]
