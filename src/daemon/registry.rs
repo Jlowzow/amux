@@ -229,4 +229,139 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert_eq!(s.len(), 20);
     }
+
+    #[test]
+    fn test_allocate_name_with_provided_name() {
+        let reg = Registry::new();
+        let name = reg.allocate_name(Some("my-session".to_string())).unwrap();
+        assert_eq!(name, "my-session");
+    }
+
+    #[test]
+    fn test_allocate_name_auto_generates_when_none() {
+        let reg = Registry::new();
+        let name = reg.allocate_name(None).unwrap();
+        // Auto-generated names are numeric strings.
+        assert!(name.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_allocate_name_rejects_empty() {
+        let reg = Registry::new();
+        let err = reg.allocate_name(Some("".to_string())).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_allocate_name_rejects_invalid_chars() {
+        let reg = Registry::new();
+        let err = reg.allocate_name(Some("my session!".to_string())).unwrap_err();
+        assert!(err.to_string().contains("only [a-zA-Z0-9_-] allowed"));
+    }
+
+    #[test]
+    fn test_allocate_name_accepts_underscores_and_hyphens() {
+        let reg = Registry::new();
+        let name = reg.allocate_name(Some("my_session-1".to_string())).unwrap();
+        assert_eq!(name, "my_session-1");
+    }
+
+    #[tokio::test]
+    async fn test_create_named_session() {
+        let mut reg = Registry::new();
+        let name = reg
+            .create(
+                Some("test-named".to_string()),
+                &["echo".to_string(), "hello".to_string()],
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(name, "test-named");
+
+        // Session should be findable by name.
+        assert!(reg.get("test-named").is_some());
+        assert!(reg.get("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_duplicate_name_fails() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("dup-test".to_string()),
+            &["echo".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let err = reg
+            .create(
+                Some("dup-test".to_string()),
+                &["echo".to_string()],
+                80,
+                24,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_named_session_appears_in_list() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("listed-session".to_string()),
+            &["echo".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let list = reg.list();
+        assert!(list.iter().any(|s| s.name == "listed-session"));
+    }
+
+    #[tokio::test]
+    async fn test_named_session_info_lookup() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("info-test".to_string()),
+            &["echo".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let info = reg.info("info-test").unwrap();
+        assert_eq!(info.name, "info-test");
+        assert!(info.alive);
+    }
+
+    #[tokio::test]
+    async fn test_kill_named_session() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("kill-me".to_string()),
+            &["sleep".to_string(), "60".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(reg.get("kill-me").is_some());
+        reg.kill("kill-me").unwrap();
+        assert!(reg.get("kill-me").is_none());
+    }
 }
