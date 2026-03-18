@@ -105,12 +105,14 @@ mod tests {
             command: vec!["bash".to_string(), "-c".to_string(), "echo hi".to_string()],
             env: None,
             cwd: None,
+            cols: None,
+            rows: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
         match decoded {
-            ClientMessage::CreateSession { name, command, env, cwd } => {
+            ClientMessage::CreateSession { name, command, env, cwd, .. } => {
                 assert_eq!(name, Some("test-session".to_string()));
                 assert_eq!(command, vec!["bash", "-c", "echo hi"]);
                 assert!(env.is_none());
@@ -130,6 +132,8 @@ mod tests {
             command: vec!["/bin/bash".to_string()],
             env: Some(env),
             cwd: None,
+            cols: None,
+            rows: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
@@ -153,6 +157,8 @@ mod tests {
             command: vec!["bash".to_string()],
             env: None,
             cwd: Some("/tmp".to_string()),
+            cols: None,
+            rows: None,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
@@ -161,6 +167,51 @@ mod tests {
             ClientMessage::CreateSession { name, cwd, .. } => {
                 assert_eq!(name, Some("cwd-test".to_string()));
                 assert_eq!(cwd, Some("/tmp".to_string()));
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_create_session_with_size() {
+        let msg = ClientMessage::CreateSession {
+            name: Some("size-test".to_string()),
+            command: vec!["bash".to_string()],
+            env: None,
+            cwd: None,
+            cols: Some(200),
+            rows: Some(50),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
+        match decoded {
+            ClientMessage::CreateSession { name, cols, rows, .. } => {
+                assert_eq!(name, Some("size-test".to_string()));
+                assert_eq!(cols, Some(200));
+                assert_eq!(rows, Some(50));
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_create_session_without_size() {
+        let msg = ClientMessage::CreateSession {
+            name: Some("nosize-test".to_string()),
+            command: vec!["bash".to_string()],
+            env: None,
+            cwd: None,
+            cols: None,
+            rows: None,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let decoded: ClientMessage = read_frame(&mut &buf[..]).unwrap();
+        match decoded {
+            ClientMessage::CreateSession { cols, rows, .. } => {
+                assert!(cols.is_none());
+                assert!(rows.is_none());
             }
             _ => panic!("expected CreateSession"),
         }

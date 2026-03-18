@@ -41,6 +41,12 @@ enum Command {
         #[arg(short = 't', long = "target")]
         name: String,
     },
+    /// Follow session output (read-only streaming, no stdin)
+    Follow {
+        /// Target session name
+        #[arg(short = 't', long = "target")]
+        name: String,
+    },
     /// List sessions
     Ls {
         /// Output in JSON format
@@ -67,6 +73,15 @@ enum Command {
         /// Print the exit code after the session exits
         #[arg(long)]
         exit_code: bool,
+    },
+    /// Watch multiple sessions and print exit events as they occur
+    Watch {
+        /// Session names to watch
+        #[arg(required = true)]
+        sessions: Vec<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
     /// Kill a session (or all sessions with --all)
     Kill {
@@ -243,6 +258,8 @@ fn main() -> anyhow::Result<()> {
                     command: cmd,
                     env: env_map,
                     cwd: cwd.clone(),
+                    cols: None,
+                    rows: None,
                 })?;
                 match resp {
                     DaemonMessage::SessionCreated { name } => {
@@ -259,11 +276,14 @@ fn main() -> anyhow::Result<()> {
                 if std::env::var("AMUX_DEBUG").is_ok() {
                     eprintln!("amux-debug: creating session (non-detached)");
                 }
+                let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let resp = client::request(&ClientMessage::CreateSession {
                     name: name.clone(),
                     command: cmd,
                     env: env_map,
                     cwd,
+                    cols: Some(term_cols),
+                    rows: Some(term_rows),
                 })?;
                 let session_name = match resp {
                     DaemonMessage::SessionCreated { name } => {
@@ -287,6 +307,10 @@ fn main() -> anyhow::Result<()> {
         Command::Attach { name } => {
             ensure_daemon_running()?;
             do_attach(&name)?;
+        }
+        Command::Follow { name } => {
+            ensure_daemon_running()?;
+            do_follow(&name)?;
         }
         Command::Ls { json } => {
             ensure_daemon_running()?;
@@ -391,6 +415,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 other => eprintln!("amux: unexpected: {:?}", other),
             }
+        }
+        Command::Watch { sessions, json } => {
+            ensure_daemon_running()?;
+            do_watch(&sessions, json)?;
         }
         Command::Kill { name, all } => {
             ensure_daemon_running()?;
@@ -526,6 +554,60 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Watch multiple sessions for exit events.
+fn do_watch(sessions: &[String], json: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use crate::protocol::codec::{read_frame, write_frame};
+
+    let mut stream =
+        client::connect().context("is the server running? try: amux start-server")?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::WatchSessions {
+            sessions: sessions.to_vec(),
+        },
+    )?;
+
+    loop {
+        let resp: DaemonMessage = read_frame(&mut stream)?;
+        match resp {
+            DaemonMessage::WatchSessionExited {
+                session,
+                exit_code,
+            } => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "session_exited",
+                            "session": session,
+                            "exit_code": exit_code,
+                        })
+                    );
+                } else {
+                    match exit_code {
+                        Some(code) => println!("{}: exited ({})", session, code),
+                        None => println!("{}: exited", session),
+                    }
+                }
+            }
+            DaemonMessage::WatchDone => {
+                break;
+            }
+            DaemonMessage::Error(e) => {
+                eprintln!("amux: error: {}", e);
+                std::process::exit(1);
+            }
+            other => {
+                eprintln!("amux: unexpected: {:?}", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Kill all sessions via the daemon.
 fn do_kill_all() -> anyhow::Result<()> {
     let resp = client::request(&ClientMessage::KillAllSessions)?;
@@ -613,6 +695,97 @@ fn do_attach(name: &str) -> anyhow::Result<()> {
         if debug { eprintln!("amux-debug: tokio stream created, entering run_attach"); }
         let (reader, mut writer) = tokio_stream.into_split();
         client::attach::run_attach(reader, &mut writer).await
+    })
+}
+
+/// Follow a session's output (read-only streaming, no stdin).
+fn do_follow(name: &str) -> anyhow::Result<()> {
+    use crate::protocol::codec::{try_read_frame_async, write_frame, write_frame_async};
+    use std::io::Write;
+
+    // Pre-check: verify session exists.
+    let resp = client::request(&ClientMessage::HasSession {
+        name: name.to_string(),
+    })?;
+    if !matches!(resp, DaemonMessage::SessionExists(true)) {
+        eprintln!("amux: session '{}' not found", name);
+        std::process::exit(1);
+    }
+
+    let mut stream = client::connect().context("is the server running?")?;
+
+    // Send Follow message.
+    write_frame(
+        &mut stream,
+        &ClientMessage::Follow {
+            name: name.to_string(),
+        },
+    )?;
+
+    // Switch to async for streaming.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        let raw_fd = stream.into_raw_fd();
+        let old_flags = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFL)
+            .map_err(|e| anyhow::anyhow!("fcntl F_GETFL on socket: {}", e))?;
+        let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(old_flags);
+        new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+        nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags))
+            .map_err(|e| anyhow::anyhow!("fcntl F_SETFL on socket: {}", e))?;
+        let tokio_stream = unsafe {
+            tokio::net::UnixStream::from_std(
+                std::os::unix::net::UnixStream::from_raw_fd(raw_fd),
+            )?
+        };
+        let (mut reader, mut writer) = tokio_stream.into_split();
+
+        // Handle Ctrl+C gracefully.
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt(),
+        )?;
+
+        let mut stdout = std::io::stdout();
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            let _ = stdout.write_all(&data);
+                            let _ = stdout.flush();
+                        }
+                        Some(Ok(DaemonMessage::SessionEnded)) => {
+                            break;
+                        }
+                        Some(Ok(DaemonMessage::Error(e))) => {
+                            eprintln!("amux: error: {}", e);
+                            std::process::exit(1);
+                        }
+                        Some(Err(e)) => {
+                            eprintln!("amux: connection error: {}", e);
+                            std::process::exit(1);
+                        }
+                        None => {
+                            eprintln!("amux: disconnected from server");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = sigint.recv() => {
+                    // Send Detach to cleanly disconnect.
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &ClientMessage::Detach,
+                    ).await;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     })
 }
 
@@ -802,6 +975,8 @@ mod tests {
                 command: vec!["cat".to_string()],
                 env: None,
                 cwd: None,
+                cols: None,
+                rows: None,
             },
         )
         .await
@@ -959,6 +1134,8 @@ mod tests {
                 command: vec!["cat".to_string()],
                 env: None,
                 cwd: None,
+                cols: None,
+                rows: None,
             },
         )
         .await
@@ -1130,6 +1307,8 @@ mod tests {
                 command: vec!["cat".to_string()],
                 env: None,
                 cwd: None,
+                cols: None,
+                rows: None,
             },
         )
         .await
@@ -1224,6 +1403,8 @@ mod tests {
                 command: vec!["cat".to_string()],
                 env: None,
                 cwd: None,
+                cols: None,
+                rows: None,
             },
         )
         .await
@@ -1326,6 +1507,165 @@ mod tests {
         assert!(got_output, "sync write → async read: never received Output from server");
 
         let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follow_streams_output() {
+        use tokio::sync::broadcast;
+        let dir = std::env::temp_dir().join(format!("amux-test-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(&mut w, &ClientMessage::CreateSession {
+            name: Some("follow-test".to_string()),
+            command: vec!["cat".to_string()],
+            env: None, cwd: None, cols: None, rows: None,
+        }).await.unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        write_frame_async(&mut w, &ClientMessage::SendInput {
+            name: "follow-test".to_string(),
+            data: b"hello-follow".to_vec(), newline: true,
+        }).await.unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::InputSent));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let stream2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut fr, mut fw) = stream2.into_split();
+        write_frame_async(&mut fw, &ClientMessage::Follow {
+            name: "follow-test".to_string(),
+        }).await.unwrap();
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut fr) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            if plain.windows(12).any(|w| w == b"hello-follow") { break; }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timeout waiting for 'hello-follow' in follow output");
+                }
+            }
+        }
+        output.clear();
+        write_frame_async(&mut w, &ClientMessage::SendInput {
+            name: "follow-test".to_string(),
+            data: b"live-data".to_vec(), newline: true,
+        }).await.unwrap();
+        let _: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut fr) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            if plain.windows(9).any(|w| w == b"live-data") { break; }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timeout waiting for 'live-data' in follow output");
+                }
+            }
+        }
+        let _ = write_frame_async(&mut fw, &ClientMessage::Detach).await;
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follow_session_ended() {
+        use tokio::sync::broadcast;
+        let dir = std::env::temp_dir().join(format!("amux-test-fend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(&mut w, &ClientMessage::CreateSession {
+            name: Some("follow-end-test".to_string()),
+            command: vec!["echo".to_string(), "bye".to_string()],
+            env: None, cwd: None, cols: None, rows: None,
+        }).await.unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stream2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut fr, mut fw) = stream2.into_split();
+        write_frame_async(&mut fw, &ClientMessage::Follow {
+            name: "follow-end-test".to_string(),
+        }).await.unwrap();
+        let mut got_ended = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut fr) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(_))) => continue,
+                        Some(Ok(DaemonMessage::SessionEnded)) => { got_ended = true; break; }
+                        other => panic!("unexpected: {:?}", other),
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(got_ended, "follow should receive SessionEnded when session exits");
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follow_nonexistent_session() {
+        use tokio::sync::broadcast;
+        let dir = std::env::temp_dir().join(format!("amux-test-fne-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut fr, mut fw) = stream.into_split();
+        write_frame_async(&mut fw, &ClientMessage::Follow {
+            name: "nonexistent".to_string(),
+        }).await.unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut fr).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::Error(e) => assert!(e.contains("not found"), "got: {}", e),
+            other => panic!("expected Error, got {:?}", other),
+        }
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
     }

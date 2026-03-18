@@ -79,9 +79,9 @@ async fn handle_connection(
                 let _ = shutdown.send(());
                 return;
             }
-            ClientMessage::CreateSession { name, command, env, cwd } => {
+            ClientMessage::CreateSession { name, command, env, cwd, cols, rows } => {
                 let mut reg = registry.lock().await;
-                match reg.create(name, &command, 80, 24, env, cwd) {
+                match reg.create(name, &command, cols.unwrap_or(80), rows.unwrap_or(24), env, cwd) {
                     Ok(name) => {
                         let _ = write_frame_async(
                             &mut writer,
@@ -151,6 +151,11 @@ async fn handle_connection(
                 // Attach takes ownership of reader/writer (connection is consumed).
                 handle_attach(reader, writer, registry.clone(), &name, cols, rows)
                     .await;
+                return;
+            }
+            ClientMessage::Follow { name } => {
+                // Follow takes ownership of the connection (read-only streaming).
+                handle_follow(reader, writer, registry.clone(), &name).await;
                 return;
             }
             ClientMessage::SendInput {
@@ -325,6 +330,11 @@ async fn handle_connection(
                     .await;
                 }
             }
+            ClientMessage::WatchSessions { sessions } => {
+                // Takes ownership of the connection (streaming).
+                handle_watch(writer, registry.clone(), sessions).await;
+                return;
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,
@@ -456,4 +466,215 @@ async fn handle_attach(
     }
 
     reader_task.abort();
+}
+
+async fn handle_follow(
+    reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    registry: Arc<Mutex<Registry>>,
+    name: &str,
+) {
+    // Get session output channel and exit watch (brief lock).
+    let (mut output_rx, mut exit_rx, scrollback_data) = {
+        let reg = registry.lock().await;
+        let session = match reg.get(name) {
+            Some(s) => s,
+            None => {
+                let _ = write_frame_async(
+                    &mut writer,
+                    &DaemonMessage::Error(format!("session '{}' not found", name)),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let output_rx = session.output_tx.subscribe();
+        let exit_rx = session.exit_watch.clone();
+        let scrollback = session
+            .scrollback
+            .lock()
+            .map(|sb| sb.contents())
+            .unwrap_or_default();
+
+        (output_rx, exit_rx, scrollback)
+    };
+
+    // Send scrollback first.
+    if !scrollback_data.is_empty() {
+        if write_frame_async(&mut writer, &DaemonMessage::Output(scrollback_data))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Spawn a reader task to detect client disconnect (e.g. Ctrl+C / Detach).
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let reader_task = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match try_read_frame_async::<ClientMessage>(&mut reader).await {
+                Some(Ok(ClientMessage::Detach)) | None => {
+                    let _ = disconnect_tx.send(()).await;
+                    break;
+                }
+                Some(Err(_)) => {
+                    let _ = disconnect_tx.send(()).await;
+                    break;
+                }
+                Some(Ok(_)) => {
+                    // Ignore unexpected messages during follow.
+                }
+            }
+        }
+    });
+
+    // Stream output to the client (read-only, no stdin forwarding).
+    loop {
+        tokio::select! {
+            output = output_rx.recv() => {
+                match output {
+                    Ok(data) => {
+                        if write_frame_async(&mut writer, &DaemonMessage::Output(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("follow output lagged by {} messages", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = write_frame_async(&mut writer, &DaemonMessage::SessionEnded).await;
+                        break;
+                    }
+                }
+            }
+            _ = exit_rx.changed() => {
+                if *exit_rx.borrow() {
+                    let _ = write_frame_async(&mut writer, &DaemonMessage::SessionEnded).await;
+                    break;
+                }
+            }
+            _ = disconnect_rx.recv() => {
+                break; // Client disconnected or sent Detach.
+            }
+        }
+    }
+
+    reader_task.abort();
+}
+
+async fn handle_watch(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    registry: Arc<Mutex<Registry>>,
+    sessions: Vec<String>,
+) {
+    use std::collections::HashMap;
+    use tokio::sync::watch;
+
+    if sessions.is_empty() {
+        let _ = write_frame_async(
+            &mut writer,
+            &DaemonMessage::Error("no sessions specified".to_string()),
+        )
+        .await;
+        return;
+    }
+
+    // Collect exit_watch receivers and exit_code handles for each session.
+    // For sessions that are already dead, send the exit event immediately.
+    let mut watchers: HashMap<String, (watch::Receiver<bool>, std::sync::Arc<std::sync::Mutex<Option<i32>>>)> =
+        HashMap::new();
+
+    {
+        let reg = registry.lock().await;
+        for name in &sessions {
+            match reg.get(name) {
+                Some(session) => {
+                    if !session.is_alive() {
+                        // Already dead — send exit event immediately.
+                        let code = session.exit_code.lock().ok().and_then(|ec| *ec);
+                        if write_frame_async(
+                            &mut writer,
+                            &DaemonMessage::WatchSessionExited {
+                                session: name.clone(),
+                                exit_code: code,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return; // Client disconnected.
+                        }
+                    } else {
+                        watchers.insert(
+                            name.clone(),
+                            (session.exit_watch.clone(), session.exit_code.clone()),
+                        );
+                    }
+                }
+                None => {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // Watch remaining live sessions using a JoinSet to avoid futures_util dependency.
+    while !watchers.is_empty() {
+        let exited_session = {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (name, (rx, _)) in &watchers {
+                let name = name.clone();
+                let mut rx = rx.clone();
+                join_set.spawn(async move {
+                    loop {
+                        if rx.changed().await.is_err() {
+                            return name; // Sender dropped.
+                        }
+                        if *rx.borrow() {
+                            return name; // io_loop signalled exit.
+                        }
+                    }
+                });
+            }
+            // Wait for the first session to exit.
+            match join_set.join_next().await {
+                Some(Ok(name)) => {
+                    join_set.abort_all();
+                    name
+                }
+                _ => break, // Shouldn't happen.
+            }
+        };
+
+        // Get exit code for the exited session.
+        let exit_code = watchers
+            .get(&exited_session)
+            .and_then(|(_, ec)| ec.lock().ok().and_then(|ec| *ec));
+
+        watchers.remove(&exited_session);
+
+        if write_frame_async(
+            &mut writer,
+            &DaemonMessage::WatchSessionExited {
+                session: exited_session,
+                exit_code,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return; // Client disconnected.
+        }
+    }
+
+    // All sessions have exited.
+    let _ = write_frame_async(&mut writer, &DaemonMessage::WatchDone).await;
 }

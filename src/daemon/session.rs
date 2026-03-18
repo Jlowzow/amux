@@ -588,4 +588,69 @@ mod tests {
         *exit_code.lock().unwrap() = Some(137);
         assert_eq!(*exit_code.lock().unwrap(), Some(137));
     }
+
+    #[tokio::test]
+    async fn test_spawn_with_custom_size() {
+        // Spawn a session with non-default terminal size and verify
+        // the PTY was created with those dimensions by asking `stty size`.
+        let session = Session::spawn(
+            "size-test".to_string(),
+            &["stty".to_string(), "size".to_string()],
+            132,
+            43,
+            None,
+            None,
+        )
+        .expect("spawn failed");
+
+        // Wait for output.
+        let mut rx = session.output_tx.subscribe();
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(data)) => output.extend_from_slice(&data),
+                _ => break,
+            }
+        }
+
+        let text = String::from_utf8_lossy(&output);
+        // `stty size` prints "rows cols\n" (e.g. "43 132\n").
+        assert!(
+            text.contains("43 132"),
+            "expected '43 132' in stty output, got: {:?}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_default_size_fallback() {
+        // When cols=0/rows=0, Session::spawn falls back to 80x24.
+        let session = Session::spawn(
+            "default-size-test".to_string(),
+            &["stty".to_string(), "size".to_string()],
+            0,
+            0,
+            None,
+            None,
+        )
+        .expect("spawn failed");
+
+        let mut rx = session.output_tx.subscribe();
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(data)) => output.extend_from_slice(&data),
+                _ => break,
+            }
+        }
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("24 80"),
+            "expected '24 80' in stty output, got: {:?}",
+            text
+        );
+    }
 }

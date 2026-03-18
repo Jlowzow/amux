@@ -12,6 +12,8 @@ pub enum ClientMessage {
         command: Vec<String>,
         env: Option<HashMap<String, String>>,
         cwd: Option<String>,
+        cols: Option<u16>,
+        rows: Option<u16>,
     },
     ListSessions,
     /// Get detailed info for a single session.
@@ -57,6 +59,10 @@ pub enum ClientMessage {
     GetAllEnv {
         name: String,
     },
+    /// Subscribe to session output without interactive attach (read-only streaming).
+    Follow {
+        name: String,
+    },
     /// Block until a session exits or a timeout elapses.
     WaitSession {
         name: String,
@@ -66,6 +72,10 @@ pub enum ClientMessage {
     /// Get the exit code of a (finished) session.
     GetExitCode {
         name: String,
+    },
+    /// Watch multiple sessions for exit events.
+    WatchSessions {
+        sessions: Vec<String>,
     },
 }
 
@@ -103,6 +113,13 @@ pub enum DaemonMessage {
     SessionExited,
     /// Exit code of a session (None if still running or unknown).
     ExitCode(Option<i32>),
+    /// A watched session exited (streamed during WatchSessions).
+    WatchSessionExited {
+        session: String,
+        exit_code: Option<i32>,
+    },
+    /// All watched sessions have exited.
+    WatchDone,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
