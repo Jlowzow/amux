@@ -51,9 +51,9 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         } => {
             query::wait_session(name, any, timeout, exit_code)?;
         }
-        Command::Watch { sessions, json } => {
+        Command::Watch { sessions, json, on_exit } => {
             ensure_daemon_running()?;
-            query::do_watch(&sessions, json)?;
+            query::do_watch(&sessions, json, on_exit.as_deref())?;
         }
         Command::Kill { name, all } => {
             ensure_daemon_running()?;

@@ -81,6 +81,10 @@ pub enum Command {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+        /// Shell command to run when a session exits.
+        /// Template variables: {name}, {code}, {pid}, {duration}
+        #[arg(long)]
+        on_exit: Option<String>,
     },
     /// Kill a session (or all sessions with --all)
     Kill {
