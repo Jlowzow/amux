@@ -19,6 +19,7 @@ fn main() -> anyhow::Result<()> {
             env: Vec::new(),
             cwd: None,
             worktree: None,
+            init_message: None,
             cmd: vec![shell],
         }
     });
