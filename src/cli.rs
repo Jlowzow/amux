@@ -42,6 +42,9 @@ pub enum Command {
         /// Target session name
         #[arg(short = 't', long = "target")]
         name: String,
+        /// Strip ANSI escape sequences from output
+        #[arg(long)]
+        plain: bool,
     },
     /// List sessions
     Ls {

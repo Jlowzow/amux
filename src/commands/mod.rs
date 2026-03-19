@@ -33,9 +33,9 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
             ensure_daemon_running()?;
             attach::do_attach(&name)?;
         }
-        Command::Follow { name } => {
+        Command::Follow { name, plain } => {
             ensure_daemon_running()?;
-            attach::do_follow(&name)?;
+            attach::do_follow(&name, plain)?;
         }
         Command::Ls { json } => {
             query::list_sessions(json)?;

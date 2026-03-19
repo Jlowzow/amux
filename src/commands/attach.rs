@@ -67,8 +67,9 @@ pub fn do_attach(name: &str) -> anyhow::Result<()> {
 }
 
 /// Follow a session's output (read-only streaming, no stdin).
-pub fn do_follow(name: &str) -> anyhow::Result<()> {
+pub fn do_follow(name: &str, plain: bool) -> anyhow::Result<()> {
     use crate::protocol::codec::{try_read_frame_async, write_frame, write_frame_async};
+    use crate::util::{clean_control_chars, strip_ansi};
     use std::io::Write;
 
     // Pre-check: verify session exists.
@@ -121,8 +122,17 @@ pub fn do_follow(name: &str) -> anyhow::Result<()> {
                 msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
                     match msg {
                         Some(Ok(DaemonMessage::Output(data))) => {
-                            let _ = stdout.write_all(&data);
-                            let _ = stdout.flush();
+                            if plain {
+                                let cleaned = clean_control_chars(&strip_ansi(&data));
+                                // Skip empty chunks that result from stripping
+                                if !cleaned.is_empty() {
+                                    let _ = stdout.write_all(&cleaned);
+                                    let _ = stdout.flush();
+                                }
+                            } else {
+                                let _ = stdout.write_all(&data);
+                                let _ = stdout.flush();
+                            }
                         }
                         Some(Ok(DaemonMessage::SessionEnded)) => {
                             break;
@@ -729,6 +739,33 @@ mod tests {
         assert!(got_ended, "follow should receive SessionEnded when session exits");
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that follow --plain strips ANSI from streamed output.
+    #[test]
+    fn test_follow_plain_strips_ansi() {
+        use crate::util::{clean_control_chars, strip_ansi};
+        // Simulate what do_follow does in plain mode: strip_ansi then clean_control_chars
+        let ansi_data = b"\x1b[32mhello\x1b[0m world\r\n";
+        let cleaned = clean_control_chars(&strip_ansi(ansi_data));
+        let output = String::from_utf8_lossy(&cleaned);
+        assert!(output.contains("hello world"), "plain output should contain 'hello world', got: {:?}", output);
+        // Should not contain ESC
+        assert!(!cleaned.contains(&0x1b), "plain output should not contain ESC bytes");
+    }
+
+    /// Test that follow --plain CLI flag is recognized.
+    #[test]
+    fn test_follow_plain_cli_flag() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["amux", "follow", "-t", "mysession", "--plain"]).unwrap();
+        match cli.command.unwrap() {
+            crate::cli::Command::Follow { name, plain } => {
+                assert_eq!(name, "mysession");
+                assert!(plain);
+            }
+            _ => panic!("expected Follow command"),
+        }
     }
 
     #[tokio::test]
