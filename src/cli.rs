@@ -152,7 +152,11 @@ pub enum Command {
         force: bool,
     },
     /// Live TUI dashboard showing all sessions
-    Top,
+    Top {
+        /// Print a single snapshot and exit (no TUI)
+        #[arg(long)]
+        once: bool,
+    },
     /// Ping the server (health check)
     Ping,
 }

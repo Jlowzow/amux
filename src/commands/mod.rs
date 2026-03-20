@@ -20,8 +20,12 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Ping => {
             server::ping()?;
         }
-        Command::Top => {
-            top::do_top()?;
+        Command::Top { once } => {
+            if once {
+                top::do_top_once()?;
+            } else {
+                top::do_top()?;
+            }
         }
         Command::New {
             name,

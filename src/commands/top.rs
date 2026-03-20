@@ -190,6 +190,36 @@ enum TopAction {
     Follow(String),
 }
 
+/// Render a plain-text snapshot of the session table (no TUI, no ANSI).
+fn render_snapshot(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<String, ActivityTracker>) -> String {
+    let frame = render_frame(sessions, term_cols, trackers);
+    let summary = summary_line(sessions);
+    let mut lines = frame;
+    lines.push(summary);
+    lines.join("\n")
+}
+
+/// Print a single snapshot of the dashboard to stdout and exit.
+pub fn do_top_once() -> anyhow::Result<()> {
+    ensure_daemon_running()?;
+
+    let mut sessions = fetch_sessions()?;
+    sort_sessions(&mut sessions);
+
+    // Build trackers from current state (no history, so sparklines will be flat)
+    let mut trackers: HashMap<String, ActivityTracker> = HashMap::new();
+    for s in &sessions {
+        trackers.insert(s.name.clone(), ActivityTracker::new(s.output_bytes));
+    }
+
+    // Use 80 columns as default when not in a terminal
+    let cols = terminal::size().map(|(c, _)| c).unwrap_or(80);
+
+    let output = render_snapshot(&sessions, cols, &trackers);
+    println!("{}", output);
+    Ok(())
+}
+
 /// Run the live TUI dashboard.
 pub fn do_top() -> anyhow::Result<()> {
     ensure_daemon_running()?;
@@ -678,7 +708,44 @@ mod tests {
     fn test_cli_top_parses() {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["amux", "top"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), crate::cli::Command::Top));
+        match cli.command.unwrap() {
+            crate::cli::Command::Top { once } => assert!(!once),
+            other => panic!("expected Top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_top_once_parses() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["amux", "top", "--once"]).unwrap();
+        match cli.command.unwrap() {
+            crate::cli::Command::Top { once } => assert!(once),
+            other => panic!("expected Top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_render_snapshot_empty() {
+        let sessions: Vec<SessionInfo> = vec![];
+        let trackers = HashMap::new();
+        let output = render_snapshot(&sessions, 80, &trackers);
+        assert!(output.contains("NAME"));
+        assert!(output.contains("0 sessions (0 alive, 0 dead)"));
+    }
+
+    #[test]
+    fn test_render_snapshot_with_sessions() {
+        let sessions = vec![
+            make_session("worker-1", true, 332, 12, None),
+            make_session("builder", false, 600, 300, Some(1)),
+        ];
+        let trackers = HashMap::new();
+        let output = render_snapshot(&sessions, 120, &trackers);
+        assert!(output.contains("worker-1"));
+        assert!(output.contains("alive"));
+        assert!(output.contains("builder"));
+        assert!(output.contains("dead"));
+        assert!(output.contains("2 sessions (1 alive, 1 dead)"));
     }
 
     // --- New tests for preview pane and selection ---
