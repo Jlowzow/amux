@@ -12,6 +12,7 @@ pub fn new_session(
     env: Vec<String>,
     cwd: Option<String>,
     worktree: Option<String>,
+    init_message: Option<String>,
     cmd: Vec<String>,
 ) -> anyhow::Result<()> {
     if std::env::var("AMUX_DEBUG").is_ok() {
@@ -33,6 +34,9 @@ pub fn new_session(
     } else {
         cwd
     };
+    // --init-message implies --detached
+    let detached = detached || init_message.is_some();
+
     if detached {
         let resp = client::request(&ClientMessage::CreateSession {
             name,
@@ -42,15 +46,25 @@ pub fn new_session(
             cols: None,
             rows: None,
         })?;
-        match resp {
+        let session_name = match resp {
             DaemonMessage::SessionCreated { name } => {
                 eprintln!("amux: created session '{}'", name);
+                name
             }
             DaemonMessage::Error(e) => {
                 eprintln!("amux: error: {}", e);
                 std::process::exit(1);
             }
-            other => eprintln!("amux: unexpected: {:?}", other),
+            other => {
+                eprintln!("amux: unexpected: {:?}", other);
+                std::process::exit(1);
+            }
+        };
+
+        if let Some(msg) = init_message {
+            // Wait for the session to produce some output (indicating readiness)
+            wait_for_session_ready(&session_name)?;
+            send_keys(&session_name, false, &[msg])?;
         }
     } else {
         // Create then attach.
@@ -84,6 +98,27 @@ pub fn new_session(
         };
         do_attach(&session_name)?;
     }
+    Ok(())
+}
+
+/// Wait for a session to produce output, indicating it is ready for input.
+/// Polls the scrollback up to 50 times (5 seconds total) waiting for non-empty output.
+fn wait_for_session_ready(name: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let resp = client::request(&ClientMessage::CaptureScrollback {
+            name: name.to_string(),
+            lines: 1,
+        })?;
+        match resp {
+            DaemonMessage::CaptureOutput(data) if !data.is_empty() => {
+                return Ok(());
+            }
+            _ => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    // Proceed anyway after timeout - the session may just not produce output before input
     Ok(())
 }
 

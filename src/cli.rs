@@ -7,7 +7,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a new session
     New {
@@ -26,6 +26,9 @@ pub enum Command {
         /// Create a git worktree and run the session in it
         #[arg(short = 'w', long = "worktree")]
         worktree: Option<String>,
+        /// Send an initial message after the session is ready (implies --detached)
+        #[arg(short = 'm', long = "init-message")]
+        init_message: Option<String>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -139,7 +142,7 @@ pub enum Command {
     Ping,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum EnvAction {
     /// Set an environment variable on a session
     Set {
@@ -178,6 +181,49 @@ mod tests {
         match result {
             Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion),
             Ok(_) => panic!("expected --version to produce DisplayVersion error"),
+        }
+    }
+
+    #[test]
+    fn test_new_init_message_flag() {
+        let cli = super::Cli::try_parse_from([
+            "amux",
+            "new",
+            "--name",
+            "worker",
+            "--detached",
+            "--init-message",
+            "Hello world",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::New {
+                name,
+                detached,
+                init_message,
+                cmd,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("worker"));
+                assert!(detached);
+                assert_eq!(init_message.as_deref(), Some("Hello world"));
+                assert_eq!(cmd, vec!["bash"]);
+            }
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_without_init_message() {
+        let cli =
+            super::Cli::try_parse_from(["amux", "new", "--detached", "--", "bash"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::New { init_message, .. } => {
+                assert!(init_message.is_none());
+            }
+            other => panic!("expected New, got {:?}", other),
         }
     }
 }
