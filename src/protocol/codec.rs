@@ -24,7 +24,12 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> anyhow::R
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    let msg = bincode::deserialize(&buf)?;
+    let msg = bincode::deserialize(&buf).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: daemon may be running an older version — try: amux kill-server && amux start-server",
+            e
+        )
+    })?;
     Ok(msg)
 }
 
@@ -54,7 +59,12 @@ pub async fn read_frame_async<T: for<'de> Deserialize<'de>>(
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
-    let msg = bincode::deserialize(&buf)?;
+    let msg = bincode::deserialize(&buf).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: daemon may be running an older version — try: amux kill-server && amux start-server",
+            e
+        )
+    })?;
     Ok(msg)
 }
 
@@ -80,7 +90,10 @@ pub async fn try_read_frame_async<T: for<'de> Deserialize<'de>>(
     }
     match bincode::deserialize(&buf) {
         Ok(msg) => Some(Ok(msg)),
-        Err(e) => Some(Err(e.into())),
+        Err(e) => Some(Err(anyhow::anyhow!(
+            "{}: daemon may be running an older version — try: amux kill-server && amux start-server",
+            e
+        ))),
     }
 }
 
@@ -361,6 +374,67 @@ mod tests {
             }
             _ => panic!("expected Attach"),
         }
+    }
+
+    #[test]
+    fn test_deserialization_mismatch_gives_helpful_error() {
+        // Simulate an old daemon sending SessionInfo without the `output_bytes` field.
+        // We create a payload from a trimmed struct and try to decode it as the full struct.
+        // The error message should suggest restarting the daemon.
+        #[derive(Serialize)]
+        struct OldSessionInfo {
+            name: String,
+            command: String,
+            pid: u32,
+            alive: bool,
+            created_at: String,
+            uptime_secs: u64,
+            last_activity: String,
+            idle_secs: u64,
+            exit_code: Option<i32>,
+            // no output_bytes field
+        }
+
+        let old_list = vec![OldSessionInfo {
+            name: "s1".to_string(),
+            command: "bash".to_string(),
+            pid: 1234,
+            alive: true,
+            created_at: "2026-02-20T12:00:00Z".to_string(),
+            uptime_secs: 60,
+            last_activity: "2026-02-20T12:00:30Z".to_string(),
+            idle_secs: 30,
+            exit_code: None,
+        }];
+
+        // Manually build a frame that looks like DaemonMessage::SessionList
+        // but with the old SessionInfo format. We'll use bincode's variant index
+        // for SessionList (index 4 in the enum) + the old payload.
+        //
+        // Instead, just serialize the old struct as a DaemonMessage-like enum:
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        enum OldDaemonMessage {
+            Pong,
+            Ok,
+            Error(String),
+            SessionCreated { name: String },
+            SessionList(Vec<OldSessionInfo>),
+        }
+
+        let msg = OldDaemonMessage::SessionList(old_list);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+
+        // Now try to read it as the real DaemonMessage — should fail with helpful message
+        let result: anyhow::Result<DaemonMessage> = read_frame(&mut &buf[..]);
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("daemon may be running an older version"),
+            "Error should suggest daemon restart, got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
