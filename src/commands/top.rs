@@ -155,12 +155,13 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<Str
 }
 
 /// Render preview lines from raw scrollback bytes.
-/// Strips ANSI, cleans control chars, and returns the last `max_lines` lines,
-/// each truncated to `max_cols`.
+/// Strips ANSI, cleans control chars, sanitizes for display, and returns the
+/// last `max_lines` lines, each truncated to `max_cols`.
 fn render_preview(raw: &[u8], max_lines: usize, max_cols: usize) -> Vec<String> {
     let stripped = util::strip_ansi(raw);
     let cleaned = util::clean_control_chars(&stripped);
-    let text = String::from_utf8_lossy(&cleaned);
+    let safe = util::sanitize_for_display(&cleaned);
+    let text = String::from_utf8_lossy(&safe);
 
     let all_lines: Vec<&str> = text.lines().collect();
     let start = all_lines.len().saturating_sub(max_lines);

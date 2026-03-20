@@ -3,7 +3,8 @@ use std::collections::HashMap;
 /// Strip ANSI escape sequences from raw bytes.
 ///
 /// Handles CSI sequences (colors, cursor movement), OSC sequences (terminal title),
-/// and other Fe escape sequences commonly found in terminal output.
+/// DCS/SOS/PM/APC string sequences, other Fe escape sequences, and single-byte
+/// C1 control codes (0x80-0x9F) commonly found in terminal output.
 pub(crate) fn strip_ansi(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -17,30 +18,17 @@ pub(crate) fn strip_ansi(input: &[u8]) -> Vec<u8> {
                 b'[' => {
                     // CSI sequence: ESC [ (parameter bytes 0x30-0x3F)* (intermediate bytes 0x20-0x2F)* (final byte 0x40-0x7E)
                     i += 1;
-                    while i < input.len() && (0x30..=0x3F).contains(&input[i]) {
-                        i += 1;
-                    }
-                    while i < input.len() && (0x20..=0x2F).contains(&input[i]) {
-                        i += 1;
-                    }
-                    if i < input.len() && (0x40..=0x7E).contains(&input[i]) {
-                        i += 1;
-                    }
+                    skip_csi_params(input, &mut i);
                 }
                 b']' => {
                     // OSC sequence: ESC ] ... (terminated by BEL or ST)
                     i += 1;
-                    while i < input.len() {
-                        if input[i] == 0x07 {
-                            i += 1;
-                            break;
-                        }
-                        if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
+                    skip_string_payload(input, &mut i);
+                }
+                b'P' | b'X' | b'^' | b'_' => {
+                    // DCS (P), SOS (X), PM (^), APC (_): string sequences terminated by ST
+                    i += 1;
+                    skip_string_payload(input, &mut i);
                 }
                 0x40..=0x5F => {
                     // Other Fe escape sequences (ESC followed by 0x40-0x5F)
@@ -50,12 +38,55 @@ pub(crate) fn strip_ansi(input: &[u8]) -> Vec<u8> {
                     // Unknown sequence after ESC, skip just the ESC
                 }
             }
+        } else if input[i] == 0x9B {
+            // Single-byte CSI (C1 control code)
+            i += 1;
+            skip_csi_params(input, &mut i);
+        } else if input[i] == 0x9D {
+            // Single-byte OSC (C1 control code)
+            i += 1;
+            skip_string_payload(input, &mut i);
+        } else if input[i] == 0x90 || input[i] == 0x98 || input[i] == 0x9E || input[i] == 0x9F {
+            // Single-byte DCS (0x90), SOS (0x98), PM (0x9E), APC (0x9F)
+            i += 1;
+            skip_string_payload(input, &mut i);
+        } else if (0x80..=0x9F).contains(&input[i]) {
+            // Other C1 control codes — skip
+            i += 1;
         } else {
             output.push(input[i]);
             i += 1;
         }
     }
     output
+}
+
+/// Skip CSI parameter bytes, intermediate bytes, and final byte.
+fn skip_csi_params(input: &[u8], i: &mut usize) {
+    while *i < input.len() && (0x30..=0x3F).contains(&input[*i]) {
+        *i += 1;
+    }
+    while *i < input.len() && (0x20..=0x2F).contains(&input[*i]) {
+        *i += 1;
+    }
+    if *i < input.len() && (0x40..=0x7E).contains(&input[*i]) {
+        *i += 1;
+    }
+}
+
+/// Skip a string payload terminated by BEL (0x07) or ST (ESC \ or 0x9C).
+fn skip_string_payload(input: &[u8], i: &mut usize) {
+    while *i < input.len() {
+        if input[*i] == 0x07 || input[*i] == 0x9C {
+            *i += 1;
+            break;
+        }
+        if input[*i] == 0x1b && *i + 1 < input.len() && input[*i + 1] == b'\\' {
+            *i += 2;
+            break;
+        }
+        *i += 1;
+    }
 }
 
 /// Process raw terminal output for clean plain-text rendering.
@@ -116,7 +147,8 @@ pub(crate) fn clean_control_chars(input: &[u8]) -> Vec<u8> {
                 lines.last_mut().unwrap().pop();
                 i += 1;
             }
-            0x07 => {
+            0x07 | 0x7F => {
+                // BEL and DEL — skip
                 i += 1;
             }
             c if c < 0x20 && c != b'\t' => {
@@ -142,6 +174,18 @@ pub(crate) fn clean_control_chars(input: &[u8]) -> Vec<u8> {
     }
 
     output
+}
+
+/// Final sanitization pass: only allow printable ASCII (0x20-0x7E), tab, and newline.
+/// Strips any remaining control characters, DEL, and non-ASCII bytes that may have
+/// leaked through strip_ansi + clean_control_chars. This is the safety net that
+/// prevents raw PTY output from corrupting the terminal display.
+pub(crate) fn sanitize_for_display(input: &[u8]) -> Vec<u8> {
+    input
+        .iter()
+        .copied()
+        .filter(|&b| b == b'\n' || b == b'\t' || (b >= 0x20 && b < 0x7F))
+        .collect()
 }
 
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
@@ -239,7 +283,7 @@ pub(crate) fn truncate(s: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, clean_control_chars, truncate};
+    use super::{strip_ansi, clean_control_chars, sanitize_for_display, truncate};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -332,6 +376,107 @@ mod tests {
     #[test]
     fn test_clean_control_chars_preserves_tabs() {
         assert_eq!(clean_control_chars(b"a\tb\n"), b"a\tb\n");
+    }
+
+    // --- strip_ansi: C1 control code handling ---
+
+    #[test]
+    fn test_strip_ansi_c1_single_byte_csi() {
+        // 0x9B is single-byte CSI (equivalent to ESC [)
+        let input = b"\x9b31mhello\x9b0m";
+        assert_eq!(strip_ansi(input), b"hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_c1_single_byte_osc() {
+        // 0x9D is single-byte OSC (equivalent to ESC ])
+        let input = b"\x9d0;title\x07hello";
+        assert_eq!(strip_ansi(input), b"hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_c1_dcs_sequence() {
+        // ESC P ... ESC \ (DCS with ST terminator)
+        let input = b"\x1bPsome data\x1b\\hello";
+        assert_eq!(strip_ansi(input), b"hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_c1_other_bytes() {
+        // Other C1 bytes (0x80-0x9F) that aren't CSI/OSC/DCS/SOS/PM/APC should be stripped
+        let mut input = vec![0x80, 0x81, 0x84, 0x85];
+        input.extend_from_slice(b"hello");
+        input.push(0x86);
+        assert_eq!(strip_ansi(&input), b"hello");
+    }
+
+    // --- clean_control_chars: DEL and high-byte handling ---
+
+    #[test]
+    fn test_clean_control_chars_strips_del() {
+        assert_eq!(clean_control_chars(b"hel\x7Flo"), b"hello\n");
+    }
+
+    // --- sanitize_for_display: final safety net ---
+
+    #[test]
+    fn test_sanitize_for_display_allows_printable() {
+        assert_eq!(sanitize_for_display(b"hello world\n"), b"hello world\n");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_allows_tabs() {
+        assert_eq!(sanitize_for_display(b"a\tb\n"), b"a\tb\n");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_strips_control_chars() {
+        assert_eq!(sanitize_for_display(b"he\x01ll\x02o"), b"hello");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_strips_high_bytes() {
+        let input = b"hello\x80\x9b\xffworld";
+        assert_eq!(sanitize_for_display(input), b"helloworld");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_strips_del() {
+        assert_eq!(sanitize_for_display(b"hel\x7Flo"), b"hello");
+    }
+
+    #[test]
+    fn test_sanitize_full_pipeline_heavy_tui() {
+        // Simulate heavy TUI output: alternate screen, cursor movements, SGR, DCS, C1, etc.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"\x1b[?1049h");         // alternate screen on
+        input.extend_from_slice(b"\x1b[2J\x1b[H");       // clear + home
+        input.extend_from_slice(b"\x1b[1;32mHello\x1b[0m"); // colored text
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(b"\x1b[?2004h");          // bracketed paste on
+        input.extend_from_slice(b"\x9b38;5;196m");        // C1 CSI color
+        input.extend_from_slice(b"World");
+        input.extend_from_slice(b"\x1b[?1049l");          // alternate screen off
+        input.push(0x7F);                                  // DEL
+        input.push(0x90);                                  // C1 DCS...
+        input.extend_from_slice(b"payload\x1b\\");         // ...terminated by ST
+        input.extend_from_slice(b"\r\nDone\n");
+
+        let stripped = strip_ansi(&input);
+        let cleaned = clean_control_chars(&stripped);
+        let safe = sanitize_for_display(&cleaned);
+        let text = String::from_utf8(safe).expect("should be valid UTF-8");
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(text.contains("Done"));
+        // No escape or control chars should remain
+        for b in text.bytes() {
+            assert!(
+                b == b'\n' || b == b'\t' || (b >= 0x20 && b < 0x7F),
+                "unexpected byte 0x{:02X} in sanitized output",
+                b
+            );
+        }
     }
 
     #[test]
