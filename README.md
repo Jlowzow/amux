@@ -52,11 +52,11 @@ amux kill --all
 # Attach (interactive, bidirectional terminal)
 amux attach -t <NAME>
 
-# Follow output (read-only stream)
+# Follow output (read-only stream, plain text by default)
 amux follow -t <NAME>
 
-# Follow with ANSI stripped (clean text)
-amux follow -t <NAME> --plain
+# Follow with raw terminal output (ANSI/control chars included)
+amux follow -t <NAME> --raw
 
 # Send keystrokes into a session
 amux send -t <NAME> "echo hello"
@@ -64,19 +64,23 @@ amux send -t <NAME> "echo hello"
 # Send literal text (no trailing newline)
 amux send -t <NAME> --literal "partial input"
 
-# Capture scrollback buffer
+# Capture scrollback buffer (plain text by default)
 amux capture -t <NAME> --lines 100
 
-# Capture with ANSI stripped
-amux capture -t <NAME> --plain
+# Capture with raw terminal output (ANSI/control chars included)
+amux capture -t <NAME> --raw
 ```
 
 ### Monitoring
 
 ```bash
-# List all sessions
+# List all sessions (long commands are truncated in plain-text mode)
 amux ls
 amux ls --json
+
+# Interactive dashboard with activity sparklines and preview pane
+amux top
+# Keybindings: j/k to select, Enter to attach, f to follow, q to quit
 
 # Detailed info for one session
 amux info -t <NAME>
@@ -130,6 +134,7 @@ Client ──Unix socket──▶ Daemon
 - **Wire protocol**: 4-byte big-endian length prefix + bincode payload (max 1MB).
 - **Attach** uses `Ctrl+B` as the prefix key (like tmux). `Ctrl+B d` detaches.
 - **Scrollback** is a 64KB ring buffer per session.
+- **Protocol mismatch** between client and daemon produces a helpful error message suggesting `amux kill-server` and restart.
 
 ---
 
@@ -322,7 +327,7 @@ amux new \
 amux send -t "bead-bd-abc" "Your bead is bd-abc. Run br show bd-abc and fix it."
 
 # Monitor
-amux capture -t "bead-bd-abc" --plain --lines 30
+amux capture -t "bead-bd-abc" --lines 30
 
 # When done, review and merge
 git diff main...SwiftFalcon
