@@ -1,6 +1,6 @@
 use crate::client;
 use crate::protocol::messages::{ClientMessage, DaemonMessage, SessionInfo};
-use crate::util::{ensure_daemon_running, truncate};
+use crate::util::{self, ensure_daemon_running, truncate};
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -10,7 +10,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{self, Attribute, Color, SetAttribute, SetForegroundColor, ResetColor},
+    style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor, ResetColor},
     terminal::{self, ClearType},
 };
 
@@ -154,6 +154,41 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<Str
     lines
 }
 
+/// Render preview lines from raw scrollback bytes.
+/// Strips ANSI, cleans control chars, and returns the last `max_lines` lines,
+/// each truncated to `max_cols`.
+fn render_preview(raw: &[u8], max_lines: usize, max_cols: usize) -> Vec<String> {
+    let stripped = util::strip_ansi(raw);
+    let cleaned = util::clean_control_chars(&stripped);
+    let text = String::from_utf8_lossy(&cleaned);
+
+    let all_lines: Vec<&str> = text.lines().collect();
+    let start = all_lines.len().saturating_sub(max_lines);
+    all_lines[start..]
+        .iter()
+        .map(|l| truncate(l, max_cols))
+        .collect()
+}
+
+/// Clamp a selection index to be within [0, count-1], or 0 if count is 0.
+fn clamp_selection(selected: usize, count: usize) -> usize {
+    if count == 0 {
+        0
+    } else if selected >= count {
+        count - 1
+    } else {
+        selected
+    }
+}
+
+/// Action returned from key handling to drive attach/follow.
+enum TopAction {
+    Continue,
+    Quit,
+    Attach(String),
+    Follow(String),
+}
+
 /// Run the live TUI dashboard.
 pub fn do_top() -> anyhow::Result<()> {
     ensure_daemon_running()?;
@@ -175,6 +210,7 @@ pub fn do_top() -> anyhow::Result<()> {
 
 fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
     let mut trackers: HashMap<String, ActivityTracker> = HashMap::new();
+    let mut selected: usize = 0;
 
     loop {
         // Poll sessions from daemon
@@ -197,8 +233,33 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         let mut sorted = sessions;
         sort_sessions(&mut sorted);
 
+        // Clamp selection
+        selected = clamp_selection(selected, sorted.len());
+
+        // Fetch scrollback for the selected session
+        let preview_raw = if !sorted.is_empty() {
+            fetch_scrollback(&sorted[selected].name, 30).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Get terminal size
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
+
+        // Layout: title(1) + blank(1) + header(1) + session_rows + blank(1) + preview_header(1) + preview_lines + summary(1) + help(1)
+        // We allocate roughly half the terminal for table, half for preview
+        let table_rows = sorted.len() as u16;
+        // Preview pane gets remaining space between table area and bottom status lines
+        // Top area: title(1) + blank(1) + header(1) + table_rows + blank(1) = 4 + table_rows
+        let top_area = 4 + table_rows;
+        // Bottom area: summary(1) + help(1) = 2
+        let bottom_area: u16 = 2;
+        // Preview area: preview_header(1) + separator(1) + preview_lines
+        let preview_total = rows.saturating_sub(top_area + bottom_area);
+        let preview_lines_count = preview_total.saturating_sub(2) as usize; // subtract header + separator
+        let preview_lines_count = if preview_lines_count > 15 { 15 } else { preview_lines_count };
+
+        let preview = render_preview(&preview_raw, preview_lines_count.max(1), cols as usize);
 
         // Clear screen and render
         execute!(
@@ -225,16 +286,66 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
             execute!(stdout, SetAttribute(Attribute::Reset))?;
         }
 
-        // Data rows
+        // Data rows with selection highlight
         for (i, line) in frame.iter().skip(1).enumerate() {
             let session = &sorted[i];
-            if session.alive {
+            if i == selected {
+                // Highlighted row: reverse video
+                execute!(
+                    stdout,
+                    SetBackgroundColor(Color::DarkGrey),
+                    SetForegroundColor(Color::White),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else if session.alive {
                 execute!(stdout, SetForegroundColor(Color::Green))?;
             } else {
                 execute!(stdout, SetForegroundColor(Color::DarkRed))?;
             }
-            write!(stdout, "{}\r\n", line)?;
+            // Pad line to full width to fill the highlight background
+            let padded = if i == selected {
+                format!("{:<width$}", line, width = cols as usize)
+            } else {
+                line.to_string()
+            };
+            write!(stdout, "{}\r\n", padded)?;
+            execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
+
+        // Preview pane
+        if preview_lines_count > 0 {
+            write!(stdout, "\r\n")?;
+
+            // Separator line
+            let separator: String = "─".repeat(cols as usize);
+            execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+            write!(stdout, "{}\r\n", separator)?;
             execute!(stdout, ResetColor)?;
+
+            // Preview header
+            let preview_title = if !sorted.is_empty() {
+                format!(" Preview: {} ", sorted[selected].name)
+            } else {
+                " Preview: (no sessions) ".to_string()
+            };
+            execute!(
+                stdout,
+                SetAttribute(Attribute::Bold),
+                SetForegroundColor(Color::Yellow)
+            )?;
+            write!(stdout, "{}\r\n", preview_title)?;
+            execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+
+            // Preview content
+            if preview.is_empty() || (preview.len() == 1 && preview[0].is_empty()) {
+                execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                write!(stdout, "  (no output)\r\n")?;
+                execute!(stdout, ResetColor)?;
+            } else {
+                for line in &preview {
+                    write!(stdout, "  {}\r\n", line)?;
+                }
+            }
         }
 
         // Summary line at bottom
@@ -248,7 +359,7 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // Help line
         execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(1)))?;
         execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-        write!(stdout, "Press q or Ctrl+C to exit")?;
+        write!(stdout, "j/k:select  Enter:attach  f:follow  q:quit")?;
         execute!(stdout, ResetColor)?;
 
         stdout.flush()?;
@@ -256,10 +367,26 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // Wait for input or timeout (poll every 2 seconds)
         if event::poll(Duration::from_secs(2))? {
             if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
-                match code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break,
-                    _ => {}
+                let action = handle_key(code, modifiers, &sorted, &mut selected);
+                match action {
+                    TopAction::Quit => break,
+                    TopAction::Attach(name) => {
+                        // Restore terminal, attach, then re-enter alternate screen
+                        terminal::disable_raw_mode()?;
+                        execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+                        // Use the attach command
+                        let _ = super::attach::do_attach(&name);
+                        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+                        terminal::enable_raw_mode()?;
+                    }
+                    TopAction::Follow(name) => {
+                        terminal::disable_raw_mode()?;
+                        execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+                        let _ = super::attach::do_follow(&name, false);
+                        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+                        terminal::enable_raw_mode()?;
+                    }
+                    TopAction::Continue => {}
                 }
             }
         }
@@ -268,10 +395,60 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Handle a key event and return the action to take.
+fn handle_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    sessions: &[SessionInfo],
+    selected: &mut usize,
+) -> TopAction {
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => TopAction::Quit,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => TopAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !sessions.is_empty() {
+                *selected = (*selected + 1).min(sessions.len() - 1);
+            }
+            TopAction::Continue
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *selected = selected.saturating_sub(1);
+            TopAction::Continue
+        }
+        KeyCode::Enter => {
+            if !sessions.is_empty() {
+                TopAction::Attach(sessions[*selected].name.clone())
+            } else {
+                TopAction::Continue
+            }
+        }
+        KeyCode::Char('f') => {
+            if !sessions.is_empty() {
+                TopAction::Follow(sessions[*selected].name.clone())
+            } else {
+                TopAction::Continue
+            }
+        }
+        _ => TopAction::Continue,
+    }
+}
+
 fn fetch_sessions() -> anyhow::Result<Vec<SessionInfo>> {
     let resp = client::request(&ClientMessage::ListSessions)?;
     match resp {
         DaemonMessage::SessionList(sessions) => Ok(sessions),
+        DaemonMessage::Error(e) => anyhow::bail!(e),
+        _ => anyhow::bail!("unexpected response"),
+    }
+}
+
+fn fetch_scrollback(name: &str, lines: usize) -> anyhow::Result<Vec<u8>> {
+    let resp = client::request(&ClientMessage::CaptureScrollback {
+        name: name.to_string(),
+        lines,
+    })?;
+    match resp {
+        DaemonMessage::CaptureOutput(data) => Ok(data),
         DaemonMessage::Error(e) => anyhow::bail!(e),
         _ => anyhow::bail!("unexpected response"),
     }
@@ -501,5 +678,178 @@ mod tests {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["amux", "top"]).unwrap();
         assert!(matches!(cli.command.unwrap(), crate::cli::Command::Top));
+    }
+
+    // --- New tests for preview pane and selection ---
+
+    #[test]
+    fn test_clamp_selection_within_bounds() {
+        assert_eq!(clamp_selection(0, 5), 0);
+        assert_eq!(clamp_selection(2, 5), 2);
+        assert_eq!(clamp_selection(4, 5), 4);
+    }
+
+    #[test]
+    fn test_clamp_selection_overflow() {
+        assert_eq!(clamp_selection(10, 5), 4);
+        assert_eq!(clamp_selection(100, 1), 0);
+    }
+
+    #[test]
+    fn test_clamp_selection_empty() {
+        assert_eq!(clamp_selection(0, 0), 0);
+        assert_eq!(clamp_selection(5, 0), 0);
+    }
+
+    #[test]
+    fn test_render_preview_plain_text() {
+        let raw = b"line one\nline two\nline three\n";
+        let result = render_preview(raw, 10, 80);
+        assert_eq!(result, vec!["line one", "line two", "line three"]);
+    }
+
+    #[test]
+    fn test_render_preview_limits_lines() {
+        let raw = b"a\nb\nc\nd\ne\n";
+        let result = render_preview(raw, 3, 80);
+        assert_eq!(result, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn test_render_preview_strips_ansi() {
+        let raw = b"\x1b[32mhello\x1b[0m\n\x1b[1mworld\x1b[0m\n";
+        let result = render_preview(raw, 10, 80);
+        assert_eq!(result, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_render_preview_truncates_wide_lines() {
+        let raw = b"this is a very long line that should be truncated\n";
+        let result = render_preview(raw, 10, 20);
+        assert_eq!(result, vec!["this is a very long\u{2026}"]);
+    }
+
+    #[test]
+    fn test_render_preview_empty() {
+        let raw = b"";
+        let result = render_preview(raw, 10, 80);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_handle_key_quit_q() {
+        let sessions = vec![make_session("a", true, 10, 1, None)];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Char('q'), KeyModifiers::NONE, &sessions, &mut sel),
+            TopAction::Quit
+        ));
+    }
+
+    #[test]
+    fn test_handle_key_quit_ctrl_c() {
+        let sessions = vec![make_session("a", true, 10, 1, None)];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL, &sessions, &mut sel),
+            TopAction::Quit
+        ));
+    }
+
+    #[test]
+    fn test_handle_key_move_down_j() {
+        let sessions = vec![
+            make_session("a", true, 10, 1, None),
+            make_session("b", true, 20, 2, None),
+            make_session("c", true, 30, 3, None),
+        ];
+        let mut sel = 0;
+        handle_key(KeyCode::Char('j'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 1);
+        handle_key(KeyCode::Char('j'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 2);
+        // Should not go past end
+        handle_key(KeyCode::Char('j'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 2);
+    }
+
+    #[test]
+    fn test_handle_key_move_up_k() {
+        let sessions = vec![
+            make_session("a", true, 10, 1, None),
+            make_session("b", true, 20, 2, None),
+        ];
+        let mut sel = 1;
+        handle_key(KeyCode::Char('k'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 0);
+        // Should not go below 0
+        handle_key(KeyCode::Char('k'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn test_handle_key_arrow_keys() {
+        let sessions = vec![
+            make_session("a", true, 10, 1, None),
+            make_session("b", true, 20, 2, None),
+        ];
+        let mut sel = 0;
+        handle_key(KeyCode::Down, KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 1);
+        handle_key(KeyCode::Up, KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn test_handle_key_enter_attach() {
+        let sessions = vec![
+            make_session("worker-1", true, 10, 1, None),
+            make_session("worker-2", true, 20, 2, None),
+        ];
+        let mut sel = 1;
+        match handle_key(KeyCode::Enter, KeyModifiers::NONE, &sessions, &mut sel) {
+            TopAction::Attach(name) => assert_eq!(name, "worker-2"),
+            _ => panic!("expected Attach action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_key_f_follow() {
+        let sessions = vec![
+            make_session("worker-1", true, 10, 1, None),
+        ];
+        let mut sel = 0;
+        match handle_key(KeyCode::Char('f'), KeyModifiers::NONE, &sessions, &mut sel) {
+            TopAction::Follow(name) => assert_eq!(name, "worker-1"),
+            _ => panic!("expected Follow action"),
+        }
+    }
+
+    #[test]
+    fn test_handle_key_enter_empty_sessions() {
+        let sessions: Vec<SessionInfo> = vec![];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Enter, KeyModifiers::NONE, &sessions, &mut sel),
+            TopAction::Continue
+        ));
+    }
+
+    #[test]
+    fn test_handle_key_f_empty_sessions() {
+        let sessions: Vec<SessionInfo> = vec![];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Char('f'), KeyModifiers::NONE, &sessions, &mut sel),
+            TopAction::Continue
+        ));
+    }
+
+    #[test]
+    fn test_handle_key_move_on_empty() {
+        let sessions: Vec<SessionInfo> = vec![];
+        let mut sel = 0;
+        handle_key(KeyCode::Char('j'), KeyModifiers::NONE, &sessions, &mut sel);
+        assert_eq!(sel, 0);
     }
 }
