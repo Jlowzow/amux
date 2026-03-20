@@ -1,6 +1,6 @@
 use crate::protocol::codec::{read_frame, write_frame};
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
-use crate::util::ensure_daemon_running;
+use crate::util::{ensure_daemon_running, truncate};
 use crate::client;
 
 use anyhow::Context;
@@ -27,7 +27,7 @@ pub fn list_sessions(json: bool) -> anyhow::Result<()> {
                         }
                     };
                     println!(
-                        "{}: {} (pid {}, up {}s, idle {}s, created {}){}", s.name, s.command, s.pid, s.uptime_secs, s.idle_secs, s.created_at, status
+                        "{}: {} (pid {}, up {}s, idle {}s, created {}){}", s.name, truncate(&s.command, 60), s.pid, s.uptime_secs, s.idle_secs, s.created_at, status
                     );
                 }
             }

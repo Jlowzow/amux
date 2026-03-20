@@ -1,6 +1,6 @@
 use crate::client;
 use crate::protocol::messages::{ClientMessage, DaemonMessage, SessionInfo};
-use crate::util::ensure_daemon_running;
+use crate::util::{ensure_daemon_running, truncate};
 
 use std::io::{self, Write};
 use std::time::Duration;
@@ -37,17 +37,6 @@ fn sort_sessions(sessions: &mut [SessionInfo]) {
     sessions.sort_by(|a, b| {
         b.alive.cmp(&a.alive).then_with(|| a.name.cmp(&b.name))
     });
-}
-
-/// Truncate a string to fit within `max_width`, adding "..." if truncated.
-fn truncate(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
-        s.to_string()
-    } else if max_width <= 3 {
-        s[..max_width].to_string()
-    } else {
-        format!("{}...", &s[..max_width - 3])
-    }
 }
 
 /// Build the summary line, e.g. "7 sessions (5 alive, 2 dead)".
@@ -295,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_truncate_long() {
-        assert_eq!(truncate("hello world foo", 10), "hello w...");
+        assert_eq!(truncate("hello world foo", 10), "hello wor…");
     }
 
     #[test]

@@ -224,9 +224,20 @@ pub(crate) fn ensure_daemon_running() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Truncate a string to fit within `max_width`, adding "…" if truncated.
+pub(crate) fn truncate(s: &str, max_width: usize) -> String {
+    if s.len() <= max_width {
+        s.to_string()
+    } else if max_width <= 3 {
+        s[..max_width].to_string()
+    } else {
+        format!("{}…", &s[..max_width - 1])
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, clean_control_chars};
+    use super::{strip_ansi, clean_control_chars, truncate};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -319,5 +330,31 @@ mod tests {
     #[test]
     fn test_clean_control_chars_preserves_tabs() {
         assert_eq!(clean_control_chars(b"a\tb\n"), b"a\tb\n");
+    }
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 60), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        let s = "a".repeat(60);
+        assert_eq!(truncate(&s, 60), s);
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        let s = "a".repeat(100);
+        let result = truncate(&s, 60);
+        assert_eq!(result.len(), 62); // 59 chars + 3-byte '…'
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), 60); // 59 + ellipsis = 60 display chars
+    }
+
+    #[test]
+    fn test_truncate_very_small_max() {
+        assert_eq!(truncate("hello", 3), "hel");
+        assert_eq!(truncate("hello", 1), "h");
     }
 }
