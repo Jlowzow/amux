@@ -38,9 +38,9 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
             ensure_daemon_running()?;
             attach::do_attach(&name)?;
         }
-        Command::Follow { name, plain } => {
+        Command::Follow { name, raw, plain: _ } => {
             ensure_daemon_running()?;
-            attach::do_follow(&name, plain)?;
+            attach::do_follow(&name, !raw)?;
         }
         Command::Ls { json } => {
             query::list_sessions(json)?;
@@ -92,8 +92,8 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Has { name } => {
             session::has_session(&name)?;
         }
-        Command::Capture { name, lines, plain } => {
-            session::capture_scrollback(&name, lines, plain)?;
+        Command::Capture { name, lines, raw, plain: _ } => {
+            session::capture_scrollback(&name, lines, !raw)?;
         }
         Command::Env { action } => {
             ensure_daemon_running()?;

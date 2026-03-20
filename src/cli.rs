@@ -45,8 +45,11 @@ pub enum Command {
         /// Target session name
         #[arg(short = 't', long = "target")]
         name: String,
-        /// Strip ANSI escape sequences from output
+        /// Output raw terminal bytes (ANSI/control chars included)
         #[arg(long)]
+        raw: bool,
+        /// Strip ANSI escape sequences (default behavior, kept for backwards compat)
+        #[arg(long, hide = true)]
         plain: bool,
     },
     /// List sessions
@@ -128,8 +131,11 @@ pub enum Command {
         /// Number of lines to dump
         #[arg(short, long, default_value = "50")]
         lines: usize,
-        /// Strip ANSI escape sequences from output
+        /// Output raw terminal bytes (ANSI/control chars included)
         #[arg(long)]
+        raw: bool,
+        /// Strip ANSI escape sequences (default behavior, kept for backwards compat)
+        #[arg(long, hide = true)]
         plain: bool,
     },
     /// Get or set session-level environment variables
@@ -221,6 +227,43 @@ mod tests {
                 assert_eq!(cmd, vec!["bash"]);
             }
             other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_capture_defaults_to_plain() {
+        let cli = super::Cli::try_parse_from(["amux", "capture", "-t", "mysession"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::Capture { name, raw, .. } => {
+                assert_eq!(name, "mysession");
+                assert!(!raw, "capture should default to plain (raw=false)");
+            }
+            other => panic!("expected Capture, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_capture_raw_flag() {
+        let cli =
+            super::Cli::try_parse_from(["amux", "capture", "-t", "mysession", "--raw"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::Capture { name, raw, .. } => {
+                assert_eq!(name, "mysession");
+                assert!(raw, "capture --raw should set raw=true");
+            }
+            other => panic!("expected Capture, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_capture_plain_compat() {
+        let cli =
+            super::Cli::try_parse_from(["amux", "capture", "-t", "mysession", "--plain"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::Capture { raw, .. } => {
+                assert!(!raw, "--plain should not set raw");
+            }
+            other => panic!("expected Capture, got {:?}", other),
         }
     }
 
