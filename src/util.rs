@@ -226,12 +226,14 @@ pub(crate) fn ensure_daemon_running() -> anyhow::Result<()> {
 
 /// Truncate a string to fit within `max_width`, adding "…" if truncated.
 pub(crate) fn truncate(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
+    let char_count = s.chars().count();
+    if char_count <= max_width {
         s.to_string()
-    } else if max_width <= 3 {
-        s[..max_width].to_string()
+    } else if max_width <= 1 {
+        s.chars().take(max_width).collect()
     } else {
-        format!("{}…", &s[..max_width - 1])
+        let truncated: String = s.chars().take(max_width - 1).collect();
+        format!("{}…", truncated)
     }
 }
 
@@ -354,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_truncate_very_small_max() {
-        assert_eq!(truncate("hello", 3), "hel");
+        assert_eq!(truncate("hello", 3), "he…");
         assert_eq!(truncate("hello", 1), "h");
     }
 }

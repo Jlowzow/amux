@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_truncate_very_short_max() {
-        assert_eq!(truncate("hello", 3), "hel");
+        assert_eq!(truncate("hello", 3), "he…");
     }
 
     #[test]
