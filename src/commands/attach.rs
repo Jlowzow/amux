@@ -754,15 +754,43 @@ mod tests {
         assert!(!cleaned.contains(&0x1b), "plain output should not contain ESC bytes");
     }
 
-    /// Test that follow --plain CLI flag is recognized.
+    /// Test that follow defaults to plain (no --raw flag).
     #[test]
-    fn test_follow_plain_cli_flag() {
+    fn test_follow_defaults_to_plain() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["amux", "follow", "-t", "mysession"]).unwrap();
+        match cli.command.unwrap() {
+            crate::cli::Command::Follow { name, raw, .. } => {
+                assert_eq!(name, "mysession");
+                assert!(!raw, "follow should default to plain (raw=false)");
+            }
+            _ => panic!("expected Follow command"),
+        }
+    }
+
+    /// Test that follow --raw flag is recognized.
+    #[test]
+    fn test_follow_raw_cli_flag() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["amux", "follow", "-t", "mysession", "--raw"]).unwrap();
+        match cli.command.unwrap() {
+            crate::cli::Command::Follow { name, raw, .. } => {
+                assert_eq!(name, "mysession");
+                assert!(raw);
+            }
+            _ => panic!("expected Follow command"),
+        }
+    }
+
+    /// Test that follow --plain is still accepted (backwards compat, no-op).
+    #[test]
+    fn test_follow_plain_cli_flag_compat() {
         use clap::Parser;
         let cli = crate::cli::Cli::try_parse_from(["amux", "follow", "-t", "mysession", "--plain"]).unwrap();
         match cli.command.unwrap() {
-            crate::cli::Command::Follow { name, plain } => {
+            crate::cli::Command::Follow { name, raw, .. } => {
                 assert_eq!(name, "mysession");
-                assert!(plain);
+                assert!(!raw, "--plain should not set raw");
             }
             _ => panic!("expected Follow command"),
         }
