@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::daemon::session::Session;
 use crate::protocol::SessionInfo;
@@ -44,7 +44,7 @@ impl Registry {
             return Ok(name);
         }
         loop {
-            let n = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let n = SESSION_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
             let name = n.to_string();
             if !self.sessions.contains_key(&name) {
                 return Ok(name);
@@ -86,6 +86,7 @@ impl Registry {
             .as_secs();
         let last_activity = format_system_time(last_activity_time);
         let exit_code = s.exit_code.lock().ok().and_then(|ec| *ec);
+        let output_bytes = s.total_output_bytes.load(std::sync::atomic::Ordering::Relaxed);
         SessionInfo {
             name: s.name.clone(),
             command: s.command.clone(),
@@ -96,6 +97,7 @@ impl Registry {
             last_activity,
             idle_secs,
             exit_code,
+            output_bytes,
         }
     }
 

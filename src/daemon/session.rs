@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command as StdCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use nix::libc;
@@ -29,6 +30,8 @@ pub struct Session {
     pub exit_code: Arc<StdMutex<Option<i32>>>,
     /// Timestamp when the session was detected as dead (for reaper retention).
     pub died_at: Arc<StdMutex<Option<std::time::SystemTime>>>,
+    /// Total bytes of PTY output produced by this session.
+    pub total_output_bytes: Arc<AtomicU64>,
     /// Session-level metadata environment variables (not process env).
     pub env_vars: HashMap<String, String>,
 }
@@ -202,6 +205,8 @@ impl Session {
         let exit_code_clone = exit_code.clone();
         let died_at: Arc<StdMutex<Option<std::time::SystemTime>>> = Arc::new(StdMutex::new(None));
         let died_at_clone = died_at.clone();
+        let total_output_bytes = Arc::new(AtomicU64::new(0));
+        let total_output_bytes_clone = total_output_bytes.clone();
 
         // Spawn the I/O task (owns the master fd via OwnedFd).
         tokio::spawn(Self::io_loop(
@@ -216,6 +221,7 @@ impl Session {
             exit_tx,
             exit_code_clone,
             died_at_clone,
+            total_output_bytes_clone,
         ));
 
         let session = Session {
@@ -232,6 +238,7 @@ impl Session {
             exit_watch: exit_rx,
             exit_code,
             died_at,
+            total_output_bytes,
             env_vars: env.unwrap_or_default(),
         };
 
@@ -250,6 +257,7 @@ impl Session {
         exit_tx: watch::Sender<bool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
         died_at: Arc<StdMutex<Option<std::time::SystemTime>>>,
+        total_output_bytes: Arc<AtomicU64>,
     ) {
         // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
@@ -294,6 +302,7 @@ impl Session {
                                     if let Ok(mut ts) = last_activity.lock() {
                                         *ts = std::time::SystemTime::now();
                                     }
+                                    total_output_bytes.fetch_add(n as u64, Ordering::Relaxed);
                                     let _ = output_tx.send(data);
                                 }
                                 Ok(Err(e)) => {

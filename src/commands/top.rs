@@ -2,6 +2,7 @@ use crate::client;
 use crate::protocol::messages::{ClientMessage, DaemonMessage, SessionInfo};
 use crate::util::ensure_daemon_running;
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -12,6 +13,58 @@ use crossterm::{
     style::{self, Attribute, Color, SetAttribute, SetForegroundColor, ResetColor},
     terminal::{self, ClearType},
 };
+
+/// Sparkline characters ordered by intensity (lowest to highest).
+const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Number of samples in the activity ring buffer.
+const ACTIVITY_SAMPLES: usize = 10;
+
+/// Tracks output byte deltas per poll interval for a single session.
+struct ActivityTracker {
+    /// Ring buffer of byte-count deltas (one per poll tick).
+    samples: [u64; ACTIVITY_SAMPLES],
+    /// Index of the next sample to write.
+    next: usize,
+    /// Last observed `output_bytes` value from SessionInfo.
+    last_bytes: u64,
+}
+
+impl ActivityTracker {
+    fn new(initial_bytes: u64) -> Self {
+        Self {
+            samples: [0; ACTIVITY_SAMPLES],
+            next: 0,
+            last_bytes: initial_bytes,
+        }
+    }
+
+    /// Record a new observation of total output bytes.
+    fn record(&mut self, current_bytes: u64) {
+        let delta = current_bytes.saturating_sub(self.last_bytes);
+        self.samples[self.next] = delta;
+        self.next = (self.next + 1) % ACTIVITY_SAMPLES;
+        self.last_bytes = current_bytes;
+    }
+
+    /// Render the sparkline string from the ring buffer.
+    fn sparkline(&self) -> String {
+        let max = self.samples.iter().copied().max().unwrap_or(0);
+        self.samples
+            .iter()
+            .cycle()
+            .skip(self.next) // start from oldest sample
+            .take(ACTIVITY_SAMPLES)
+            .map(|&val| {
+                if max == 0 {
+                    SPARKLINE_CHARS[0]
+                } else {
+                    let idx = ((val as f64 / max as f64) * 7.0).round() as usize;
+                    SPARKLINE_CHARS[idx.min(7)]
+                }
+            })
+            .collect()
+    }
+}
 
 /// Format seconds into a human-readable duration string like "5m32s" or "2h15m".
 fn format_duration(secs: u64) -> String {
@@ -59,13 +112,14 @@ fn summary_line(sessions: &[SessionInfo]) -> String {
 }
 
 /// Render one frame of the dashboard to a buffer.
-fn render_frame(sessions: &[SessionInfo], term_cols: u16) -> Vec<String> {
+fn render_frame(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<String, ActivityTracker>) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Header
+    // Fixed columns: name(16) + status(8) + pid(8) + uptime(8) + idle(8) + exit(6) + activity(11) + spaces(7) = 72
     let header = format!(
-        "{:<16} {:<8} {:>8} {:>8} {:>8} {:>6} {}",
-        "NAME", "STATUS", "PID", "UPTIME", "IDLE", "EXIT", "COMMAND"
+        "{:<16} {:<8} {:>8} {:>8} {:>8} {:>6} {:<11} {}",
+        "NAME", "STATUS", "PID", "UPTIME", "IDLE", "EXIT", "ACTIVITY", "COMMAND"
     );
     lines.push(header);
 
@@ -79,9 +133,14 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16) -> Vec<String> {
         let uptime = format_duration(s.uptime_secs);
         let idle = format_duration(s.idle_secs);
 
+        let sparkline = trackers
+            .get(&s.name)
+            .map(|t| t.sparkline())
+            .unwrap_or_else(|| SPARKLINE_CHARS[0].to_string().repeat(ACTIVITY_SAMPLES));
+
         // Calculate remaining space for command column
-        // Fixed columns: name(16) + status(8) + pid(8) + uptime(8) + idle(8) + exit(6) + spaces(6) = 60
-        let fixed_width = 60;
+        // Fixed columns: name(16) + status(8) + pid(8) + uptime(8) + idle(8) + exit(6) + activity(11) + spaces(7) = 72
+        let fixed_width = 72;
         let cmd_width = if (term_cols as usize) > fixed_width + 4 {
             (term_cols as usize) - fixed_width
         } else {
@@ -90,13 +149,14 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16) -> Vec<String> {
         let cmd = truncate(&s.command, cmd_width);
 
         let row = format!(
-            "{:<16} {:<8} {:>8} {:>8} {:>8} {:>6} {}",
+            "{:<16} {:<8} {:>8} {:>8} {:>8} {:>6} {:<11} {}",
             truncate(&s.name, 16),
             status,
             s.pid,
             uptime,
             idle,
             exit_str,
+            sparkline,
             cmd
         );
         lines.push(row);
@@ -125,12 +185,25 @@ pub fn do_top() -> anyhow::Result<()> {
 }
 
 fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
+    let mut trackers: HashMap<String, ActivityTracker> = HashMap::new();
+
     loop {
         // Poll sessions from daemon
         let sessions = match fetch_sessions() {
             Ok(s) => s,
             Err(_) => Vec::new(), // Show empty if daemon unreachable
         };
+
+        // Update activity trackers for each session
+        for s in &sessions {
+            trackers
+                .entry(s.name.clone())
+                .and_modify(|t| t.record(s.output_bytes))
+                .or_insert_with(|| ActivityTracker::new(s.output_bytes));
+        }
+
+        // Remove trackers for sessions that no longer exist
+        trackers.retain(|name, _| sessions.iter().any(|s| &s.name == name));
 
         let mut sorted = sessions;
         sort_sessions(&mut sorted);
@@ -156,7 +229,7 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         write!(stdout, "\r\n\r\n")?;
 
         // Header row
-        let frame = render_frame(&sorted, cols);
+        let frame = render_frame(&sorted, cols, &trackers);
         if let Some(header) = frame.first() {
             execute!(stdout, SetAttribute(Attribute::Bold))?;
             write!(stdout, "{}\r\n", header)?;
@@ -231,6 +304,7 @@ mod tests {
             last_activity: "2026-01-01T00:00:00Z".to_string(),
             idle_secs: idle,
             exit_code,
+            output_bytes: 0,
         }
     }
 
@@ -331,13 +405,15 @@ mod tests {
     #[test]
     fn test_render_frame_header() {
         let sessions: Vec<SessionInfo> = vec![];
-        let frame = render_frame(&sessions, 120);
+        let trackers = HashMap::new();
+        let frame = render_frame(&sessions, 120, &trackers);
         assert_eq!(frame.len(), 1); // just header
         assert!(frame[0].contains("NAME"));
         assert!(frame[0].contains("STATUS"));
         assert!(frame[0].contains("PID"));
         assert!(frame[0].contains("UPTIME"));
         assert!(frame[0].contains("IDLE"));
+        assert!(frame[0].contains("ACTIVITY"));
         assert!(frame[0].contains("COMMAND"));
     }
 
@@ -347,7 +423,8 @@ mod tests {
             make_session("worker-1", true, 332, 12, None),
             make_session("builder", false, 600, 300, Some(1)),
         ];
-        let frame = render_frame(&sessions, 120);
+        let trackers = HashMap::new();
+        let frame = render_frame(&sessions, 120, &trackers);
         assert_eq!(frame.len(), 3); // header + 2 rows
         assert!(frame[1].contains("worker-1"));
         assert!(frame[1].contains("alive"));
@@ -355,6 +432,79 @@ mod tests {
         assert!(frame[2].contains("builder"));
         assert!(frame[2].contains("dead"));
         assert!(frame[2].contains("1")); // exit code
+    }
+
+    #[test]
+    fn test_activity_tracker_idle() {
+        let tracker = ActivityTracker::new(0);
+        let sparkline = tracker.sparkline();
+        assert_eq!(sparkline, "▁▁▁▁▁▁▁▁▁▁");
+    }
+
+    #[test]
+    fn test_activity_tracker_single_burst() {
+        let mut tracker = ActivityTracker::new(0);
+        tracker.record(1000);
+        // After one record: samples = [1000, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        // Oldest starts at index 1, so we get: [0,0,0,0,0,0,0,0,0,1000]
+        let sparkline = tracker.sparkline();
+        assert_eq!(sparkline, "▁▁▁▁▁▁▁▁▁█");
+    }
+
+    #[test]
+    fn test_activity_tracker_uniform() {
+        let mut tracker = ActivityTracker::new(0);
+        for i in 1..=10 {
+            tracker.record(i * 100);
+        }
+        // All deltas are 100, all should map to max (█)
+        let sparkline = tracker.sparkline();
+        assert_eq!(sparkline, "██████████");
+    }
+
+    #[test]
+    fn test_activity_tracker_ramp() {
+        let mut tracker = ActivityTracker::new(0);
+        // Create increasing deltas: 100, 200, 300, ..., 1000
+        let mut total = 0u64;
+        for i in 1..=10 {
+            total += i * 100;
+            tracker.record(total);
+        }
+        let sparkline = tracker.sparkline();
+        let chars: Vec<char> = sparkline.chars().collect();
+        // Should be monotonically non-decreasing
+        for i in 1..chars.len() {
+            assert!(chars[i] >= chars[i - 1], "sparkline should be non-decreasing");
+        }
+        // Last should be highest
+        assert_eq!(*chars.last().unwrap(), '█');
+    }
+
+    #[test]
+    fn test_activity_tracker_wraps_around() {
+        let mut tracker = ActivityTracker::new(0);
+        // Record 12 samples (wraps around the 10-element buffer)
+        for i in 1..=12 {
+            tracker.record(i * 50);
+        }
+        // Should still produce 10-char sparkline
+        assert_eq!(tracker.sparkline().chars().count(), 10);
+    }
+
+    #[test]
+    fn test_sparkline_in_render_frame() {
+        let mut sessions = vec![make_session("active", true, 100, 2, None)];
+        sessions[0].output_bytes = 5000;
+        let mut trackers = HashMap::new();
+        let mut t = ActivityTracker::new(0);
+        t.record(1000);
+        t.record(2000);
+        t.record(5000);
+        trackers.insert("active".to_string(), t);
+        let frame = render_frame(&sessions, 120, &trackers);
+        // Row should contain sparkline characters
+        assert!(frame[1].contains('▁') || frame[1].contains('█') || frame[1].contains('▃'));
     }
 
     #[test]

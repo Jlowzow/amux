@@ -149,4 +149,6 @@ pub struct SessionInfo {
     pub idle_secs: u64,
     /// Exit code of the session process (None if still running).
     pub exit_code: Option<i32>,
+    /// Total bytes of PTY output produced by this session.
+    pub output_bytes: u64,
 }
