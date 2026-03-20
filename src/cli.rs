@@ -145,6 +145,8 @@ pub enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Live TUI dashboard showing all sessions
+    Top,
     /// Ping the server (health check)
     Ping,
 }

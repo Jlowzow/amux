@@ -2,6 +2,7 @@ mod attach;
 mod query;
 mod server;
 mod session;
+mod top;
 
 use crate::cli::{Command, EnvAction};
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
@@ -18,6 +19,9 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::Ping => {
             server::ping()?;
+        }
+        Command::Top => {
+            top::do_top()?;
         }
         Command::New {
             name,
