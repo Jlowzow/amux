@@ -162,8 +162,64 @@ pub fn wait_session(
     Ok(())
 }
 
+/// Expand an on-exit template, substituting `{name}`, `{code}`, `{pid}`, `{duration}`.
+fn expand_on_exit_template(
+    template: &str,
+    name: &str,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+    duration: Option<u64>,
+) -> String {
+    template
+        .replace("{name}", name)
+        .replace(
+            "{code}",
+            &exit_code.map(|c| c.to_string()).unwrap_or_default(),
+        )
+        .replace(
+            "{pid}",
+            &pid.map(|p| p.to_string()).unwrap_or_default(),
+        )
+        .replace(
+            "{duration}",
+            &duration.map(|d| d.to_string()).unwrap_or_default(),
+        )
+}
+
+/// Run an on-exit callback shell command.
+fn run_on_exit_callback(command: &str) {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+    {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!(
+                    "amux: on-exit callback exited with {}",
+                    status.code().unwrap_or(-1)
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("amux: failed to run on-exit callback: {}", e);
+        }
+    }
+}
+
+/// Fetch pid and uptime for a session (best-effort, returns None on failure).
+fn fetch_session_meta(name: &str) -> (Option<u32>, Option<u64>) {
+    let resp = client::request(&ClientMessage::GetSessionInfo {
+        name: name.to_string(),
+    });
+    match resp {
+        Ok(DaemonMessage::SessionDetail(info)) => (Some(info.pid), Some(info.uptime_secs)),
+        _ => (None, None),
+    }
+}
+
 /// Watch multiple sessions for exit events.
-pub fn do_watch(sessions: &[String], json: bool) -> anyhow::Result<()> {
+pub fn do_watch(sessions: &[String], json: bool, on_exit: Option<&str>) -> anyhow::Result<()> {
     let mut stream =
         client::connect().context("is the server running? try: amux start-server")?;
     write_frame(
@@ -195,6 +251,14 @@ pub fn do_watch(sessions: &[String], json: bool) -> anyhow::Result<()> {
                         None => println!("{}: exited", session),
                     }
                 }
+
+                if let Some(template) = on_exit {
+                    let (pid, duration) = fetch_session_meta(&session);
+                    let expanded = expand_on_exit_template(
+                        template, &session, exit_code, pid, duration,
+                    );
+                    run_on_exit_callback(&expanded);
+                }
             }
             DaemonMessage::WatchDone => {
                 break;
@@ -215,8 +279,51 @@ pub fn do_watch(sessions: &[String], json: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::expand_on_exit_template;
     use crate::protocol::codec::{try_read_frame_async, write_frame_async};
     use crate::protocol::messages::{ClientMessage, DaemonMessage};
+
+    #[test]
+    fn test_expand_on_exit_template_all_vars() {
+        let result = expand_on_exit_template(
+            "echo {name} exited with {code}, pid={pid}, dur={duration}",
+            "worker-1",
+            Some(0),
+            Some(1234),
+            Some(60),
+        );
+        assert_eq!(result, "echo worker-1 exited with 0, pid=1234, dur=60");
+    }
+
+    #[test]
+    fn test_expand_on_exit_template_none_values() {
+        let result = expand_on_exit_template(
+            "{name} code={code} pid={pid} dur={duration}",
+            "sess",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result, "sess code= pid= dur=");
+    }
+
+    #[test]
+    fn test_expand_on_exit_template_no_placeholders() {
+        let result = expand_on_exit_template("echo done", "x", Some(1), Some(2), Some(3));
+        assert_eq!(result, "echo done");
+    }
+
+    #[test]
+    fn test_expand_on_exit_template_repeated_vars() {
+        let result = expand_on_exit_template(
+            "{name}-{name}",
+            "abc",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(result, "abc-abc");
+    }
 
     /// Integration test: WatchSessions receives exit events for multiple sessions.
     #[tokio::test]
