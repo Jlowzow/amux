@@ -190,6 +190,78 @@ enum TopAction {
     Follow(String),
 }
 
+/// Absolute row positions for each section of the top TUI.
+///
+/// All rendering uses `MoveTo(0, row)` — we never rely on sequential writes
+/// advancing the cursor into the right place. This guarantees no section can
+/// overwrite another regardless of preview length or content filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopLayout {
+    title_row: u16,
+    header_row: u16,
+    data_row_start: u16,
+    data_row_count: u16,
+    separator_row: Option<u16>,
+    preview_header_row: Option<u16>,
+    preview_row_start: Option<u16>,
+    preview_row_count: u16,
+    summary_row: u16,
+    help_row: u16,
+}
+
+/// Maximum preview content lines regardless of available space.
+const PREVIEW_MAX_LINES: u16 = 15;
+
+/// Compute non-overlapping absolute row positions for every section.
+///
+/// Layout shape (top to bottom):
+///   title(1) + blank(1) + header(1) + N data rows + blank(1) + separator(1)
+///   + preview_header(1) + preview_content(K) + ... + summary(1) + help(1)
+///
+/// Data rows and preview content are bounded so that their ranges stay
+/// strictly above `summary_row = rows - 2`. If the terminal is too short to
+/// fit a preview section, the preview fields are `None`.
+fn compute_layout(session_count: u16, rows: u16) -> TopLayout {
+    let title_row: u16 = 0;
+    let header_row: u16 = 2;
+    let data_row_start: u16 = 3;
+    let summary_row = rows.saturating_sub(2);
+    let help_row = rows.saturating_sub(1);
+
+    // Reserve 4 rows at the bottom of the middle area for a minimal preview
+    // section: blank + separator + header + at least one content line.
+    // Whatever's left after the reservation is available for the table.
+    let middle_budget = summary_row.saturating_sub(data_row_start);
+    let preview_reservation: u16 = 4;
+    let max_data = middle_budget.saturating_sub(preview_reservation);
+    let data_row_count = session_count.min(max_data);
+    let data_row_end = data_row_start.saturating_add(data_row_count);
+
+    // Preview starts one blank row after the table.
+    let separator_row = data_row_end.saturating_add(1);
+    let preview_header_row = separator_row.saturating_add(1);
+    let preview_row_start = preview_header_row.saturating_add(1);
+
+    let preview_row_count = summary_row
+        .saturating_sub(preview_row_start)
+        .min(PREVIEW_MAX_LINES);
+
+    let has_preview = preview_row_count > 0 && preview_row_start < summary_row;
+
+    TopLayout {
+        title_row,
+        header_row,
+        data_row_start,
+        data_row_count,
+        separator_row: if has_preview { Some(separator_row) } else { None },
+        preview_header_row: if has_preview { Some(preview_header_row) } else { None },
+        preview_row_start: if has_preview { Some(preview_row_start) } else { None },
+        preview_row_count,
+        summary_row,
+        help_row,
+    }
+}
+
 /// Render a plain-text snapshot of the session table (no TUI, no ANSI).
 fn render_snapshot(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<String, ActivityTracker>) -> String {
     let frame = render_frame(sessions, term_cols, trackers);
@@ -276,52 +348,51 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
 
         // Get terminal size
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let layout = compute_layout(sorted.len() as u16, rows);
 
-        // Layout: title(1) + blank(1) + header(1) + session_rows + blank(1) + preview_header(1) + preview_lines + summary(1) + help(1)
-        // We allocate roughly half the terminal for table, half for preview
-        let table_rows = sorted.len() as u16;
-        // Preview pane gets remaining space between table area and bottom status lines
-        // Top area: title(1) + blank(1) + header(1) + table_rows + blank(1) = 4 + table_rows
-        let top_area = 4 + table_rows;
-        // Bottom area: summary(1) + help(1) = 2
-        let bottom_area: u16 = 2;
-        // Preview area: preview_header(1) + separator(1) + preview_lines
-        let preview_total = rows.saturating_sub(top_area + bottom_area);
-        let preview_lines_count = preview_total.saturating_sub(2) as usize; // subtract header + separator
-        let preview_lines_count = if preview_lines_count > 15 { 15 } else { preview_lines_count };
+        let preview = render_preview(
+            &preview_raw,
+            layout.preview_row_count.max(1) as usize,
+            cols as usize,
+        );
 
-        let preview = render_preview(&preview_raw, preview_lines_count.max(1), cols as usize);
-
-        // Clear screen and render
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
+        // Clear the full screen once, then render every section at an
+        // absolute row. No section relies on sequential cursor movement, so
+        // short preview content or filtered blank lines can never cause one
+        // section to spill into another's rows.
+        execute!(stdout, terminal::Clear(ClearType::All))?;
 
         // Title
         execute!(
             stdout,
+            cursor::MoveTo(0, layout.title_row),
             SetAttribute(Attribute::Bold),
             SetForegroundColor(Color::Cyan)
         )?;
         write!(stdout, "amux top")?;
         execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
-        write!(stdout, "\r\n\r\n")?;
 
         // Header row
         let frame = render_frame(&sorted, cols, &trackers);
         if let Some(header) = frame.first() {
-            execute!(stdout, SetAttribute(Attribute::Bold))?;
-            write!(stdout, "{}\r\n", header)?;
+            execute!(
+                stdout,
+                cursor::MoveTo(0, layout.header_row),
+                SetAttribute(Attribute::Bold)
+            )?;
+            write!(stdout, "{}", header)?;
             execute!(stdout, SetAttribute(Attribute::Reset))?;
         }
 
-        // Data rows with selection highlight
-        for (i, line) in frame.iter().skip(1).enumerate() {
+        // Data rows with selection highlight (bounded by layout.data_row_count)
+        for i in 0..layout.data_row_count as usize {
+            let line = match frame.get(i + 1) {
+                Some(l) => l,
+                None => break,
+            };
             let session = &sorted[i];
+            execute!(stdout, cursor::MoveTo(0, layout.data_row_start + i as u16))?;
             if i == selected {
-                // Highlighted row: reverse video
                 execute!(
                     stdout,
                     SetBackgroundColor(Color::DarkGrey),
@@ -333,24 +404,29 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
             } else {
                 execute!(stdout, SetForegroundColor(Color::DarkRed))?;
             }
-            // Pad line to full width to fill the highlight background
             let padded = if i == selected {
                 format!("{:<width$}", line, width = cols as usize)
             } else {
                 line.to_string()
             };
-            write!(stdout, "{}\r\n", padded)?;
+            write!(stdout, "{}", padded)?;
             execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         }
 
         // Preview pane
-        if preview_lines_count > 0 {
-            write!(stdout, "\r\n")?;
-
-            // Separator line
+        if let (Some(sep_row), Some(ph_row), Some(pr_start)) = (
+            layout.separator_row,
+            layout.preview_header_row,
+            layout.preview_row_start,
+        ) {
+            // Separator
             let separator: String = "─".repeat(cols as usize);
-            execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-            write!(stdout, "{}\r\n", separator)?;
+            execute!(
+                stdout,
+                cursor::MoveTo(0, sep_row),
+                SetForegroundColor(Color::DarkGrey)
+            )?;
+            write!(stdout, "{}", separator)?;
             execute!(stdout, ResetColor)?;
 
             // Preview header
@@ -361,35 +437,49 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
             };
             execute!(
                 stdout,
+                cursor::MoveTo(0, ph_row),
                 SetAttribute(Attribute::Bold),
                 SetForegroundColor(Color::Yellow)
             )?;
-            write!(stdout, "{}\r\n", preview_title)?;
+            write!(stdout, "{}", preview_title)?;
             execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
 
             // Preview content
             if preview.is_empty() || (preview.len() == 1 && preview[0].is_empty()) {
-                execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-                write!(stdout, "  (no output)\r\n")?;
+                execute!(
+                    stdout,
+                    cursor::MoveTo(0, pr_start),
+                    SetForegroundColor(Color::DarkGrey)
+                )?;
+                write!(stdout, "  (no output)")?;
                 execute!(stdout, ResetColor)?;
             } else {
-                for line in &preview {
-                    write!(stdout, "  {}\r\n", line)?;
+                for (i, line) in preview.iter().enumerate() {
+                    if i >= layout.preview_row_count as usize {
+                        break;
+                    }
+                    execute!(stdout, cursor::MoveTo(0, pr_start + i as u16))?;
+                    write!(stdout, "  {}", line)?;
                 }
             }
         }
 
-        // Summary line at bottom
+        // Summary line
         let summary = summary_line(&sorted);
-        let summary_row = rows.saturating_sub(2);
-        execute!(stdout, cursor::MoveTo(0, summary_row))?;
-        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        execute!(
+            stdout,
+            cursor::MoveTo(0, layout.summary_row),
+            SetForegroundColor(Color::DarkGrey)
+        )?;
         write!(stdout, "{}", summary)?;
         execute!(stdout, ResetColor)?;
 
         // Help line
-        execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(1)))?;
-        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        execute!(
+            stdout,
+            cursor::MoveTo(0, layout.help_row),
+            SetForegroundColor(Color::DarkGrey)
+        )?;
         write!(stdout, "j/k:select  Enter:attach  f:follow  q:quit")?;
         execute!(stdout, ResetColor)?;
 
@@ -928,5 +1018,117 @@ mod tests {
         let mut sel = 0;
         handle_key(KeyCode::Char('j'), KeyModifiers::NONE, &sessions, &mut sel);
         assert_eq!(sel, 0);
+    }
+
+    // --- Layout tests: guard the fix for bd-9ep (preview overwritten by summary) ---
+
+    /// Walk every row position the layout reports and check that no two
+    /// ranges overlap and nothing escapes the terminal.
+    fn assert_layout_consistent(layout: &TopLayout, rows: u16) {
+        assert!(layout.title_row < rows, "title_row out of bounds");
+        assert!(layout.header_row < rows, "header_row out of bounds");
+        assert!(layout.summary_row < rows, "summary_row out of bounds");
+        assert!(layout.help_row < rows, "help_row out of bounds");
+
+        // Ordering of the bottom two rows
+        assert!(
+            layout.summary_row < layout.help_row,
+            "summary must be above help"
+        );
+
+        // Data rows sit between header and summary
+        let data_end = layout.data_row_start + layout.data_row_count; // exclusive
+        assert!(
+            layout.data_row_start > layout.header_row,
+            "data must be below header"
+        );
+        assert!(
+            data_end <= layout.summary_row,
+            "data rows overflow into summary (data_end={}, summary_row={})",
+            data_end, layout.summary_row
+        );
+
+        // Preview (if present) sits entirely between data rows and summary
+        if let (Some(sep), Some(ph), Some(pr)) = (
+            layout.separator_row,
+            layout.preview_header_row,
+            layout.preview_row_start,
+        ) {
+            assert!(sep >= data_end, "separator overlaps data rows");
+            assert_eq!(ph, sep + 1, "preview header must follow separator");
+            assert_eq!(pr, ph + 1, "preview content must follow its header");
+            let preview_end = pr + layout.preview_row_count; // exclusive
+            assert!(
+                preview_end <= layout.summary_row,
+                "preview content overflows into summary (preview_end={}, summary_row={})",
+                preview_end,
+                layout.summary_row
+            );
+        }
+    }
+
+    #[test]
+    fn test_layout_no_overlap_across_sizes() {
+        // Sweep plausible terminal sizes and session counts; every layout
+        // must be self-consistent (no section overlaps another).
+        for &rows in &[12u16, 18, 20, 24, 30, 40, 60, 100] {
+            for &n in &[0u16, 1, 2, 3, 5, 8, 12, 20, 50] {
+                let layout = compute_layout(n, rows);
+                assert_layout_consistent(&layout, rows);
+            }
+        }
+    }
+
+    #[test]
+    fn test_layout_reserves_summary_help_rows() {
+        let layout = compute_layout(3, 24);
+        assert_eq!(layout.summary_row, 22);
+        assert_eq!(layout.help_row, 23);
+    }
+
+    #[test]
+    fn test_layout_preview_never_overruns_summary_standard_terminal() {
+        // This is the exact shape the bug manifested on: default 80x24 PTY
+        // with a small session table. The old layout math let the preview
+        // end on the same row the summary's MoveTo later clobbered.
+        let layout = compute_layout(1, 24);
+        let pr = layout.preview_row_start.expect("preview should fit");
+        let end = pr + layout.preview_row_count;
+        assert!(
+            end <= layout.summary_row,
+            "preview ends at row {} but summary is at {}",
+            end, layout.summary_row
+        );
+    }
+
+    #[test]
+    fn test_layout_caps_preview_at_max_lines() {
+        // A very tall terminal shouldn't give us an unbounded preview.
+        let layout = compute_layout(0, 100);
+        assert!(layout.preview_row_count <= PREVIEW_MAX_LINES);
+    }
+
+    #[test]
+    fn test_layout_drops_preview_on_tiny_terminal() {
+        // On a 7-row terminal the summary/help rows consume what's left after
+        // title/blank/header — layout should report no preview section rather
+        // than returning overlapping rows.
+        let layout = compute_layout(2, 7);
+        assert_layout_consistent(&layout, 7);
+        assert!(
+            layout.preview_row_start.is_none() && layout.preview_row_count == 0,
+            "expected no preview on tiny terminal, got {:?}",
+            layout
+        );
+    }
+
+    #[test]
+    fn test_layout_caps_data_rows_when_sessions_exceed_space() {
+        // 50 sessions can't fit on a 24-row terminal; the table must be
+        // clipped so that summary/help rows stay reachable.
+        let layout = compute_layout(50, 24);
+        assert_layout_consistent(&layout, 24);
+        let data_end = layout.data_row_start + layout.data_row_count;
+        assert!(data_end < layout.summary_row);
     }
 }

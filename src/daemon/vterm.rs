@@ -46,7 +46,10 @@ impl VirtualTerminal {
             return String::new();
         }
         let contents = self.rendered_screen();
-        let lines: Vec<&str> = contents.lines().collect();
+        let lines: Vec<&str> = contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         let start = lines.len().saturating_sub(n);
         lines[start..].join("\n")
     }

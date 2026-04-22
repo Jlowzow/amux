@@ -125,22 +125,36 @@ fi
 
 # ---------------------------------------------------------------------------
 # TEST 1 — Plain-text target, preview pane should show its lines verbatim.
+#
+# We produce 12 uniquely-tagged lines so that the preview has to render a
+# *full* screen of content, not just a few lines clinging to the top. This
+# catches layout bugs where the summary's absolute cursor jump clobbers the
+# last rendered preview row (see bd-9ep).
 # ---------------------------------------------------------------------------
 info "1. Preview of a plain-text session"
 T1="00-ec1-${PID}-1-plain"
 V1="zzz-ec1-${PID}-1-viewer"
 TOKEN1="UNIQMARKER_ALPHA_BETAGAMMA"
+NLINES1=12
+NLINES1_PADDED="$(printf '%02d' "$NLINES1")"
 
-"$AMUX" new --name "$T1" --detached -- \
-    bash -c "printf '%s\n' '${TOKEN1}_ONE' '${TOKEN1}_TWO' '${TOKEN1}_THREE'; sleep 120" \
+# A single printf emits all N tokens, each on its own line. Keeping this in
+# one command avoids multi-line parsing woes when quoted through bash -c.
+SCRIPT1="for i in \$(seq 1 ${NLINES1}); do printf '%s_%02d\\n' '${TOKEN1}' \"\$i\"; done; sleep 120"
+
+"$AMUX" new --name "$T1" --detached -- bash -c "$SCRIPT1" \
     >/dev/null 2>&1 || fail "spawn target '$T1' failed"
 track "$T1"
 
 wait_for 3 "$AMUX" has --target "$T1" || fail "target '$T1' never appeared"
 
-# Wait for target output to land in its scrollback
-target_has_token() { "$AMUX" capture --target "$T1" --lines 50 2>/dev/null | grep -q "$TOKEN1"; }
-wait_for 4 target_has_token || fail "target '$T1' never produced output containing '$TOKEN1'"
+# Wait for the *last* token to land — if we only waited for the first, an
+# output truncation bug could pass silently.
+target_has_last_token() {
+    "$AMUX" capture --target "$T1" --lines 50 2>/dev/null \
+        | grep -q "${TOKEN1}_${NLINES1_PADDED}"
+}
+wait_for 4 target_has_last_token || fail "target '$T1' never produced last token '${TOKEN1}_${NLINES1_PADDED}'"
 
 "$AMUX" new --name "$V1" --detached -- "$AMUX" top >/dev/null 2>&1 \
     || fail "spawn viewer '$V1' failed"
@@ -160,6 +174,39 @@ if printf '%s' "$PREVIEW1" | grep -q "$TOKEN1"; then
     pass "preview contains target's token ($TOKEN1)"
 else
     fail "preview missing '$TOKEN1'. preview was:
+---
+$PREVIEW1
+---"
+fi
+
+# Count how many of the 12 unique tokens actually landed in the preview body.
+# A layout bug that lets the summary line overwrite the last preview row (or
+# that short-circuits preview rendering) shows up here as a missing tail
+# token, even though earlier tokens would still pass the simple "contains"
+# check above. This is the test guard for bd-9ep.
+FOUND1=0
+for i in $(seq 1 "$NLINES1"); do
+    TOK="$(printf '%s_%02d' "$TOKEN1" "$i")"
+    if printf '%s' "$PREVIEW1" | grep -q "$TOK"; then
+        FOUND1=$((FOUND1 + 1))
+    fi
+done
+if [ "$FOUND1" -ge "$NLINES1" ]; then
+    pass "preview contains all $NLINES1 emitted tokens"
+else
+    fail "preview is missing some of the $NLINES1 tokens — only found $FOUND1. preview was:
+---
+$PREVIEW1
+---"
+fi
+
+# Specifically: the LAST token must appear. A classic summary-overwrites-
+# preview bug kills exactly the bottom row of the preview pane.
+LAST_TOKEN="${TOKEN1}_${NLINES1_PADDED}"
+if printf '%s' "$PREVIEW1" | grep -q "$LAST_TOKEN"; then
+    pass "preview contains the final token ($LAST_TOKEN) — bottom row survived"
+else
+    fail "preview missing the final token ($LAST_TOKEN) — summary may be overwriting the last preview row. preview was:
 ---
 $PREVIEW1
 ---"
