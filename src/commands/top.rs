@@ -209,8 +209,7 @@ struct TopLayout {
     help_row: u16,
 }
 
-/// Maximum preview content lines regardless of available space.
-const PREVIEW_MAX_LINES: u16 = 15;
+// No artificial cap — preview uses all available terminal rows.
 
 /// Compute non-overlapping absolute row positions for every section.
 ///
@@ -223,28 +222,27 @@ const PREVIEW_MAX_LINES: u16 = 15;
 /// fit a preview section, the preview fields are `None`.
 fn compute_layout(session_count: u16, rows: u16) -> TopLayout {
     let title_row: u16 = 0;
-    let header_row: u16 = 2;
-    let data_row_start: u16 = 3;
-    let summary_row = rows.saturating_sub(2);
-    let help_row = rows.saturating_sub(1);
+    let header_row: u16 = 1;
+    let data_row_start: u16 = 2;
+    let summary_row = rows.saturating_sub(1);
+    let help_row = rows.saturating_sub(1); // combined with summary
 
-    // Reserve 4 rows at the bottom of the middle area for a minimal preview
-    // section: blank + separator + header + at least one content line.
+    // Reserve 3 rows at the bottom of the middle area for a minimal preview
+    // section: separator + header + at least one content line.
     // Whatever's left after the reservation is available for the table.
     let middle_budget = summary_row.saturating_sub(data_row_start);
-    let preview_reservation: u16 = 4;
+    let preview_reservation: u16 = 3;
     let max_data = middle_budget.saturating_sub(preview_reservation);
     let data_row_count = session_count.min(max_data);
     let data_row_end = data_row_start.saturating_add(data_row_count);
 
-    // Preview starts one blank row after the table.
-    let separator_row = data_row_end.saturating_add(1);
+    // Preview starts immediately after the table.
+    let separator_row = data_row_end;
     let preview_header_row = separator_row.saturating_add(1);
     let preview_row_start = preview_header_row.saturating_add(1);
 
     let preview_row_count = summary_row
-        .saturating_sub(preview_row_start)
-        .min(PREVIEW_MAX_LINES);
+        .saturating_sub(preview_row_start);
 
     let has_preview = preview_row_count > 0 && preview_row_start < summary_row;
 
@@ -464,23 +462,14 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
             }
         }
 
-        // Summary line
+        // Status bar (summary + help combined on one line)
         let summary = summary_line(&sorted);
         execute!(
             stdout,
             cursor::MoveTo(0, layout.summary_row),
             SetForegroundColor(Color::DarkGrey)
         )?;
-        write!(stdout, "{}", summary)?;
-        execute!(stdout, ResetColor)?;
-
-        // Help line
-        execute!(
-            stdout,
-            cursor::MoveTo(0, layout.help_row),
-            SetForegroundColor(Color::DarkGrey)
-        )?;
-        write!(stdout, "j/k:select  Enter:attach  f:follow  q:quit")?;
+        write!(stdout, "{}  │  j/k:select  Enter:attach  f:follow  q:quit", summary)?;
         execute!(stdout, ResetColor)?;
 
         stdout.flush()?;
@@ -1030,10 +1019,10 @@ mod tests {
         assert!(layout.summary_row < rows, "summary_row out of bounds");
         assert!(layout.help_row < rows, "help_row out of bounds");
 
-        // Ordering of the bottom two rows
-        assert!(
-            layout.summary_row < layout.help_row,
-            "summary must be above help"
+        // Summary and help are on the same row (combined status bar)
+        assert_eq!(
+            layout.summary_row, layout.help_row,
+            "summary and help should share the same row"
         );
 
         // Data rows sit between header and summary
@@ -1080,9 +1069,9 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_reserves_summary_help_rows() {
+    fn test_layout_reserves_status_bar() {
         let layout = compute_layout(3, 24);
-        assert_eq!(layout.summary_row, 22);
+        assert_eq!(layout.summary_row, 23);
         assert_eq!(layout.help_row, 23);
     }
 
@@ -1102,18 +1091,17 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_caps_preview_at_max_lines() {
-        // A very tall terminal shouldn't give us an unbounded preview.
+    fn test_layout_preview_uses_available_space() {
+        // Preview should use all available rows between header and summary.
         let layout = compute_layout(0, 100);
-        assert!(layout.preview_row_count <= PREVIEW_MAX_LINES);
+        assert!(layout.preview_row_count > 15, "tall terminal should give more than 15 preview lines, got {}", layout.preview_row_count);
     }
 
     #[test]
     fn test_layout_drops_preview_on_tiny_terminal() {
-        // On a 7-row terminal the summary/help rows consume what's left after
-        // title/blank/header — layout should report no preview section rather
-        // than returning overlapping rows.
-        let layout = compute_layout(2, 7);
+        // On a 5-row terminal there's no room for preview after
+        // title/header/data/status — layout should report no preview section.
+        let layout = compute_layout(2, 5);
         assert_layout_consistent(&layout, 7);
         assert!(
             layout.preview_row_start.is_none() && layout.preview_row_count == 0,
