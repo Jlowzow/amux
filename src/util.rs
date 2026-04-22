@@ -176,18 +176,6 @@ pub(crate) fn clean_control_chars(input: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Final sanitization pass: only allow printable ASCII (0x20-0x7E), tab, and newline.
-/// Strips any remaining control characters, DEL, and non-ASCII bytes that may have
-/// leaked through strip_ansi + clean_control_chars. This is the safety net that
-/// prevents raw PTY output from corrupting the terminal display.
-pub(crate) fn sanitize_for_display(input: &[u8]) -> Vec<u8> {
-    input
-        .iter()
-        .copied()
-        .filter(|&b| b == b'\n' || b == b'\t' || (b >= 0x20 && b < 0x7F))
-        .collect()
-}
-
 /// Parse `-e KEY=VALUE` strings into an env map. Returns None if no vars specified.
 pub(crate) fn parse_env_vars(
     vars: &[String],
@@ -283,7 +271,7 @@ pub(crate) fn truncate(s: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, clean_control_chars, sanitize_for_display, truncate};
+    use super::{strip_ansi, clean_control_chars, truncate};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -415,68 +403,6 @@ mod tests {
     #[test]
     fn test_clean_control_chars_strips_del() {
         assert_eq!(clean_control_chars(b"hel\x7Flo"), b"hello\n");
-    }
-
-    // --- sanitize_for_display: final safety net ---
-
-    #[test]
-    fn test_sanitize_for_display_allows_printable() {
-        assert_eq!(sanitize_for_display(b"hello world\n"), b"hello world\n");
-    }
-
-    #[test]
-    fn test_sanitize_for_display_allows_tabs() {
-        assert_eq!(sanitize_for_display(b"a\tb\n"), b"a\tb\n");
-    }
-
-    #[test]
-    fn test_sanitize_for_display_strips_control_chars() {
-        assert_eq!(sanitize_for_display(b"he\x01ll\x02o"), b"hello");
-    }
-
-    #[test]
-    fn test_sanitize_for_display_strips_high_bytes() {
-        let input = b"hello\x80\x9b\xffworld";
-        assert_eq!(sanitize_for_display(input), b"helloworld");
-    }
-
-    #[test]
-    fn test_sanitize_for_display_strips_del() {
-        assert_eq!(sanitize_for_display(b"hel\x7Flo"), b"hello");
-    }
-
-    #[test]
-    fn test_sanitize_full_pipeline_heavy_tui() {
-        // Simulate heavy TUI output: alternate screen, cursor movements, SGR, DCS, C1, etc.
-        let mut input: Vec<u8> = Vec::new();
-        input.extend_from_slice(b"\x1b[?1049h");         // alternate screen on
-        input.extend_from_slice(b"\x1b[2J\x1b[H");       // clear + home
-        input.extend_from_slice(b"\x1b[1;32mHello\x1b[0m"); // colored text
-        input.extend_from_slice(b"\r\n");
-        input.extend_from_slice(b"\x1b[?2004h");          // bracketed paste on
-        input.extend_from_slice(b"\x9b38;5;196m");        // C1 CSI color
-        input.extend_from_slice(b"World");
-        input.extend_from_slice(b"\x1b[?1049l");          // alternate screen off
-        input.push(0x7F);                                  // DEL
-        input.push(0x90);                                  // C1 DCS...
-        input.extend_from_slice(b"payload\x1b\\");         // ...terminated by ST
-        input.extend_from_slice(b"\r\nDone\n");
-
-        let stripped = strip_ansi(&input);
-        let cleaned = clean_control_chars(&stripped);
-        let safe = sanitize_for_display(&cleaned);
-        let text = String::from_utf8(safe).expect("should be valid UTF-8");
-        assert!(text.contains("Hello"));
-        assert!(text.contains("World"));
-        assert!(text.contains("Done"));
-        // No escape or control chars should remain
-        for b in text.bytes() {
-            assert!(
-                b == b'\n' || b == b'\t' || (b >= 0x20 && b < 0x7F),
-                "unexpected byte 0x{:02X} in sanitized output",
-                b
-            );
-        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::client;
 use crate::protocol::messages::{ClientMessage, DaemonMessage, SessionInfo};
-use crate::util::{self, ensure_daemon_running, truncate};
+use crate::util::{ensure_daemon_running, truncate};
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -154,15 +154,15 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<Str
     lines
 }
 
-/// Render preview lines from raw scrollback bytes.
-/// Strips ANSI, cleans control chars, sanitizes for display, and returns the
-/// last `max_lines` lines, each truncated to `max_cols`.
+/// Render preview lines from vterm-rendered scrollback.
+///
+/// The daemon returns the virtual-terminal screen (rendered mode), which is
+/// already clean UTF-8 with ANSI sequences and control chars consumed by the
+/// emulator. We preserve the bytes verbatim so unicode glyphs used by TUI
+/// apps (box-drawing, progress bars, spinners) survive — an aggressive
+/// ASCII-only sanitize would blank most of the preview.
 fn render_preview(raw: &[u8], max_lines: usize, max_cols: usize) -> Vec<String> {
-    let stripped = util::strip_ansi(raw);
-    let cleaned = util::clean_control_chars(&stripped);
-    let safe = util::sanitize_for_display(&cleaned);
-    let text = String::from_utf8_lossy(&safe);
-
+    let text = String::from_utf8_lossy(raw);
     let all_lines: Vec<&str> = text.lines().collect();
     let start = all_lines.len().saturating_sub(max_lines);
     all_lines[start..]
@@ -788,13 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_preview_strips_ansi() {
-        let raw = b"\x1b[32mhello\x1b[0m\n\x1b[1mworld\x1b[0m\n";
-        let result = render_preview(raw, 10, 80);
-        assert_eq!(result, vec!["hello", "world"]);
-    }
-
-    #[test]
     fn test_render_preview_truncates_wide_lines() {
         let raw = b"this is a very long line that should be truncated\n";
         let result = render_preview(raw, 10, 20);
@@ -806,6 +799,18 @@ mod tests {
         let raw = b"";
         let result = render_preview(raw, 10, 80);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_preview_preserves_unicode() {
+        // vterm-rendered output for TUIs contains unicode box-drawing,
+        // progress bars, and glyphs. Preview must preserve them verbatim.
+        let raw = "│ Opus 4.7 │\n────────\n█░░░░ 10%\n".as_bytes();
+        let result = render_preview(raw, 10, 80);
+        assert_eq!(
+            result,
+            vec!["│ Opus 4.7 │", "────────", "█░░░░ 10%"]
+        );
     }
 
     #[test]
