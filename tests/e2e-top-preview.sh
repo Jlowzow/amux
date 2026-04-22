@@ -394,6 +394,135 @@ $PREVIEW3
 fi
 
 # ---------------------------------------------------------------------------
+# TEST 4 — j/k selection: sending 'j'/'k' to a live `amux top` viewer must
+# move the preview selection between sessions. This is the interactive-mode
+# counterpart to the unit tests on handle_key() — it proves that the real
+# PTY path (amux send -> daemon -> PTY -> crossterm::event::read) actually
+# reaches handle_key and that the preview pane re-renders accordingly.
+# ---------------------------------------------------------------------------
+info "4. j/k moves preview selection between sessions"
+T4A="00-pes-${PID}-4-a-alpha"
+T4B="00-pes-${PID}-4-b-bravo"
+V4="zzz-pes-${PID}-4-viewer"
+TOKEN_A="UNIQ_JKSEL_ALPHA_TOKEN"
+TOKEN_B="UNIQ_JKSEL_BRAVO_TOKEN"
+
+# Both targets print their distinctive token and then idle. Each runs in bash
+# -c so the heredoc-style script survives the exec into PTY.
+"$AMUX" new --name "$T4A" --detached -- bash -c "printf '%s\\n' '${TOKEN_A}'; sleep 120" \
+    >/dev/null 2>&1 || fail "spawn target '$T4A' failed"
+track "$T4A"
+"$AMUX" new --name "$T4B" --detached -- bash -c "printf '%s\\n' '${TOKEN_B}'; sleep 120" \
+    >/dev/null 2>&1 || fail "spawn target '$T4B' failed"
+track "$T4B"
+
+wait_for 3 "$AMUX" has --target "$T4A" || fail "target '$T4A' never appeared"
+wait_for 3 "$AMUX" has --target "$T4B" || fail "target '$T4B' never appeared"
+
+# Wait for both tokens to actually hit scrollback so the preview has content
+# to display on whichever side we select.
+a_has_token() { "$AMUX" capture --target "$T4A" --lines 20 2>/dev/null | grep -q "$TOKEN_A"; }
+b_has_token() { "$AMUX" capture --target "$T4B" --lines 20 2>/dev/null | grep -q "$TOKEN_B"; }
+wait_for 4 a_has_token || fail "target '$T4A' never produced '$TOKEN_A'"
+wait_for 4 b_has_token || fail "target '$T4B' never produced '$TOKEN_B'"
+
+"$AMUX" new --name "$V4" --detached -- "$AMUX" top >/dev/null 2>&1 \
+    || fail "spawn viewer '$V4' failed"
+track "$V4"
+
+viewer4_has_preview() { "$AMUX" capture --target "$V4" --lines 100 2>/dev/null | grep -q 'Preview:'; }
+wait_for 8 viewer4_has_preview || fail "viewer '$V4' never rendered 'Preview:' header"
+
+# Poll the viewer's "Preview: <name>" header until it matches expected, or
+# fail after ~6s. amux top polls stdin every 2s so a single keystroke should
+# land within that window; we give a couple of cycles of slack.
+wait_for_preview_target() {
+    local viewer="$1" expected="$2"
+    local deadline=$(( $(date +%s) + 6 ))
+    local current
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        current="$(preview_target "$viewer" || true)"
+        [ "$current" = "$expected" ] && return 0
+        sleep 0.3
+    done
+    return 1
+}
+
+# Initial state: alpha sorts before bravo, so alpha should be selected.
+if wait_for_preview_target "$V4" "$T4A"; then
+    pass "initial preview selects '$T4A' (alphabetically first)"
+else
+    CURRENT="$(preview_target "$V4" || echo '<none>')"
+    fail "initial preview selected '$CURRENT' — expected '$T4A'"
+fi
+
+PREVIEW4A="$(extract_preview "$V4")"
+if printf '%s' "$PREVIEW4A" | grep -q "$TOKEN_A"; then
+    pass "initial preview body contains alpha's token ($TOKEN_A)"
+else
+    fail "initial preview body missing '$TOKEN_A'. preview was:
+---
+$PREVIEW4A
+---"
+fi
+
+# Press 'j' — should move selection down to bravo.
+"$AMUX" send --target "$V4" --literal j >/dev/null 2>&1 \
+    || fail "send 'j' to viewer '$V4' failed"
+
+if wait_for_preview_target "$V4" "$T4B"; then
+    pass "after 'j', preview selects '$T4B'"
+else
+    CURRENT="$(preview_target "$V4" || echo '<none>')"
+    fail "after 'j', preview selected '$CURRENT' — expected '$T4B'"
+fi
+
+PREVIEW4B="$(extract_preview "$V4")"
+if printf '%s' "$PREVIEW4B" | grep -q "$TOKEN_B"; then
+    pass "after 'j', preview body contains bravo's token ($TOKEN_B)"
+else
+    fail "after 'j', preview body missing '$TOKEN_B'. preview was:
+---
+$PREVIEW4B
+---"
+fi
+
+# Guard against stale content: alpha's token must NOT still be in the pane
+# (the header already shifted, but we want to catch render bugs that leave
+# the previous session's scrollback on screen).
+if printf '%s' "$PREVIEW4B" | grep -q "$TOKEN_A"; then
+    fail "after 'j', preview still shows alpha's token ($TOKEN_A) — preview didn't re-render"
+else
+    pass "after 'j', preview no longer shows alpha's token"
+fi
+
+# Press 'k' — should move selection back to alpha.
+"$AMUX" send --target "$V4" --literal k >/dev/null 2>&1 \
+    || fail "send 'k' to viewer '$V4' failed"
+
+if wait_for_preview_target "$V4" "$T4A"; then
+    pass "after 'k', preview selects '$T4A' again"
+else
+    CURRENT="$(preview_target "$V4" || echo '<none>')"
+    fail "after 'k', preview selected '$CURRENT' — expected '$T4A'"
+fi
+
+PREVIEW4C="$(extract_preview "$V4")"
+if printf '%s' "$PREVIEW4C" | grep -q "$TOKEN_A"; then
+    pass "after 'k', preview body contains alpha's token ($TOKEN_A) again"
+else
+    fail "after 'k', preview body missing '$TOKEN_A'. preview was:
+---
+$PREVIEW4C
+---"
+fi
+
+"$AMUX" kill --target "$V4" >/dev/null 2>&1 || true
+"$AMUX" kill --target "$T4A" >/dev/null 2>&1 || true
+"$AMUX" kill --target "$T4B" >/dev/null 2>&1 || true
+sleep 0.4
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo
