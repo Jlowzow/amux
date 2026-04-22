@@ -185,14 +185,26 @@ async fn handle_connection(
                 let _ =
                     write_frame_async(&mut writer, &DaemonMessage::SessionExists(exists)).await;
             }
-            ClientMessage::CaptureScrollback { name, lines } => {
+            ClientMessage::CaptureScrollback { name, lines, raw } => {
                 let reg = registry.lock().await;
                 if let Some(session) = reg.get(&name) {
-                    let data = session
-                        .scrollback
-                        .lock()
-                        .map(|sb| sb.last_lines(lines))
-                        .unwrap_or_default();
+                    let data = if raw {
+                        // Raw mode: return the raw PTY byte stream.
+                        session
+                            .scrollback
+                            .lock()
+                            .map(|sb| sb.last_lines(lines))
+                            .unwrap_or_default()
+                    } else {
+                        // Rendered mode: return the virtual-terminal screen
+                        // contents. Correct for TUI apps that draw with
+                        // cursor-addressed control sequences.
+                        session
+                            .vterm
+                            .lock()
+                            .map(|vt| vt.rendered_last_lines(lines).into_bytes())
+                            .unwrap_or_default()
+                    };
                     let _ =
                         write_frame_async(&mut writer, &DaemonMessage::CaptureOutput(data)).await;
                 } else {

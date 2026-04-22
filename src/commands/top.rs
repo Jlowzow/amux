@@ -474,9 +474,13 @@ fn fetch_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 }
 
 fn fetch_scrollback(name: &str, lines: usize) -> anyhow::Result<Vec<u8>> {
+    // Ask for the rendered virtual-terminal screen so TUI apps (which draw
+    // with cursor-addressed escape sequences) preview correctly. The raw
+    // byte stream would yield garbled fragments after naive ANSI stripping.
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,
+        raw: false,
     })?;
     match resp {
         DaemonMessage::CaptureOutput(data) => Ok(data),

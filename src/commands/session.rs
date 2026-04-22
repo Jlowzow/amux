@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::protocol::messages::{ClientMessage, DaemonMessage};
-use crate::util::{clean_control_chars, create_git_worktree, ensure_daemon_running, parse_env_vars, sanitize_for_display, strip_ansi};
+use crate::util::{create_git_worktree, ensure_daemon_running, parse_env_vars};
 use crate::client;
 
 use super::attach::do_attach;
@@ -108,6 +108,7 @@ fn wait_for_session_ready(name: &str) -> anyhow::Result<()> {
         let resp = client::request(&ClientMessage::CaptureScrollback {
             name: name.to_string(),
             lines: 1,
+            raw: false,
         })?;
         match resp {
             DaemonMessage::CaptureOutput(data) if !data.is_empty() => {
@@ -190,19 +191,26 @@ pub fn has_session(name: &str) -> anyhow::Result<()> {
 
 pub fn capture_scrollback(name: &str, lines: usize, plain: bool) -> anyhow::Result<()> {
     ensure_daemon_running()?;
+    // Plain mode (the default) asks the daemon for the rendered virtual
+    // terminal screen, which correctly handles TUI apps that redraw with
+    // cursor-addressed escape sequences. Raw mode streams the PTY bytes
+    // verbatim so callers can re-render them in their own terminal.
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,
+        raw: !plain,
     })?;
     match resp {
         DaemonMessage::CaptureOutput(data) => {
             use std::io::Write;
-            let output = if plain {
-                sanitize_for_display(&clean_control_chars(&strip_ansi(&data)))
-            } else {
-                data
-            };
-            std::io::stdout().write_all(&output)?;
+            // Plain mode is already rendered by the daemon. Raw mode
+            // passes bytes through untouched.
+            std::io::stdout().write_all(&data)?;
+            // The rendered screen has no trailing newline; add one for
+            // nicer shell output so the prompt lands on a fresh line.
+            if plain && !data.ends_with(b"\n") {
+                std::io::stdout().write_all(b"\n")?;
+            }
         }
         DaemonMessage::Error(e) => {
             eprintln!("amux: error: {}", e);
@@ -286,6 +294,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "send-test".to_string(),
                 lines: 10,
+                raw: true,
             },
         )
         .await
@@ -371,6 +380,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "cap-active".to_string(),
                 lines: 50,
+                raw: true,
             },
         )
         .await
@@ -445,6 +455,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "cap-dead".to_string(),
                 lines: 50,
+                raw: true,
             },
         )
         .await
@@ -497,6 +508,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "nonexistent".to_string(),
                 lines: 10,
+                raw: false,
             },
         )
         .await

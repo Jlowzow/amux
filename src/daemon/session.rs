@@ -10,6 +10,8 @@ use nix::pty::{openpty, Winsize};
 use nix::unistd::{self, ForkResult};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use super::vterm::VirtualTerminal;
+
 const SCROLLBACK_SIZE: usize = 64 * 1024; // 64KB
 
 pub struct Session {
@@ -24,6 +26,12 @@ pub struct Session {
     pub resize_tx: mpsc::Sender<(u16, u16)>,
     pub kill_tx: Option<oneshot::Sender<()>>,
     pub scrollback: Arc<StdMutex<Scrollback>>,
+    /// Virtual terminal emulator maintaining rendered screen state.
+    /// Used by CaptureScrollback and preview to return cursor-addressed
+    /// final screen contents (correct for TUI apps), rather than replaying
+    /// the raw byte stream with stripped ANSI (which produces garbled
+    /// fragments for apps that use cursor movement).
+    pub vterm: Arc<StdMutex<VirtualTerminal>>,
     /// Receiver that yields `true` when the session's io_loop exits.
     pub exit_watch: watch::Receiver<bool>,
     /// Child process exit code, set by io_loop after waitpid.
@@ -198,6 +206,11 @@ impl Session {
         let command_str = cmd.join(" ");
         let scrollback = Arc::new(StdMutex::new(Scrollback::new()));
         let scrollback_clone = scrollback.clone();
+        let vterm = Arc::new(StdMutex::new(VirtualTerminal::new(
+            winsize.ws_row,
+            winsize.ws_col,
+        )));
+        let vterm_clone = vterm.clone();
         let now = std::time::SystemTime::now();
         let last_activity = Arc::new(StdMutex::new(now));
         let last_activity_clone = last_activity.clone();
@@ -215,6 +228,7 @@ impl Session {
             input_rx,
             output_tx_clone,
             scrollback_clone,
+            vterm_clone,
             last_activity_clone,
             resize_rx,
             kill_rx,
@@ -235,6 +249,7 @@ impl Session {
             resize_tx,
             kill_tx: Some(kill_tx),
             scrollback,
+            vterm,
             exit_watch: exit_rx,
             exit_code,
             died_at,
@@ -251,6 +266,7 @@ impl Session {
         mut input_rx: mpsc::Receiver<Vec<u8>>,
         output_tx: broadcast::Sender<Vec<u8>>,
         scrollback: Arc<StdMutex<Scrollback>>,
+        vterm: Arc<StdMutex<VirtualTerminal>>,
         last_activity: Arc<StdMutex<std::time::SystemTime>>,
         mut resize_rx: mpsc::Receiver<(u16, u16)>,
         mut kill_rx: oneshot::Receiver<()>,
@@ -295,9 +311,12 @@ impl Session {
                                 Ok(Ok(0)) => break, // EOF
                                 Ok(Ok(n)) => {
                                     let data = read_buf[..n].to_vec();
-                                    // Store in scrollback and update activity timestamp.
+                                    // Store in scrollback, feed virtual terminal, update activity.
                                     if let Ok(mut sb) = scrollback.lock() {
                                         sb.push(&data);
+                                    }
+                                    if let Ok(mut vt) = vterm.lock() {
+                                        vt.process(&data);
                                     }
                                     if let Ok(mut ts) = last_activity.lock() {
                                         *ts = std::time::SystemTime::now();
@@ -374,6 +393,9 @@ impl Session {
                             libc::TIOCSWINSZ as _,
                             &winsize as *const Winsize,
                         );
+                    }
+                    if let Ok(mut vt) = vterm.lock() {
+                        vt.resize(rows, cols);
                     }
                 }
                 // Kill signal.

@@ -43,9 +43,16 @@ pub enum ClientMessage {
     HasSession {
         name: String,
     },
+    /// Capture session scrollback. When `raw` is true the daemon returns the
+    /// raw PTY byte stream (ANSI, cursor sequences, and all); when false
+    /// (the default) the daemon returns the rendered virtual-terminal screen
+    /// as plain UTF-8 text. Rendering produces correct output for TUI apps
+    /// that use cursor movement (CSI H, CSI 2J, etc.) to redraw in place;
+    /// stripping ANSI from the raw stream would yield garbled fragments.
     CaptureScrollback {
         name: String,
         lines: usize,
+        raw: bool,
     },
     SetEnv {
         name: String,

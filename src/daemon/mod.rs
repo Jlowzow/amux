@@ -1,6 +1,7 @@
 pub mod registry;
 pub mod server;
 pub mod session;
+pub mod vterm;
 
 use std::fs;
 use std::os::fd::AsRawFd;
