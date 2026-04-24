@@ -2,9 +2,18 @@ use crate::protocol::messages::{ClientMessage, DaemonMessage};
 use crate::{client, common, daemon};
 
 pub fn start_server() -> anyhow::Result<()> {
-    if common::server_running() {
+    if common::daemon_alive() {
         eprintln!("amux: server is already running");
         return Ok(());
+    }
+    // The pid file can outlive the daemon (e.g. after SIGKILL) and may
+    // even point to an unrelated reused pid. fork_daemon also validates
+    // + reclaims, but reporting it here gives users a clearer trail.
+    if common::pid_file_path().exists() && !common::pid_file_points_to_amux() {
+        eprintln!(
+            "amux: removing stale pid file at {}",
+            common::pid_file_path().display()
+        );
     }
     daemon::fork_daemon()?;
     Ok(())

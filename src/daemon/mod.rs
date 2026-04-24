@@ -26,14 +26,15 @@ pub fn fork_daemon() -> anyhow::Result<()> {
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create runtime dir: {}", run_dir.display()))?;
 
-    // Clean stale socket.
-    if sock_path.exists() {
-        if common::server_running() {
-            bail!("server is already running");
-        }
-        fs::remove_file(&sock_path)
-            .with_context(|| format!("failed to remove stale socket: {}", sock_path.display()))?;
+    // Daemon is only "running" when both the socket is accepting
+    // connections AND the pid file points to a live amux process. If
+    // either signal is stale (kill -9 leaves both behind; ordinary
+    // shutdown leaves neither), clear everything and fork fresh.
+    if common::daemon_alive() {
+        bail!("server is already running");
     }
+    common::clear_stale_runtime_files()
+        .with_context(|| format!("failed to clear stale runtime files in {}", run_dir.display()))?;
 
     // Fork: daemon must fork BEFORE tokio runtime.
     match unsafe { unistd::fork() }.context("fork failed")? {
