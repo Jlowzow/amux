@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::protocol::messages::{ClientMessage, DaemonMessage};
+use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
 use crate::util::{create_git_worktree, ensure_daemon_running, parse_env_vars};
 use crate::client;
 
@@ -108,7 +108,7 @@ fn wait_for_session_ready(name: &str) -> anyhow::Result<()> {
         let resp = client::request(&ClientMessage::CaptureScrollback {
             name: name.to_string(),
             lines: 1,
-            raw: false,
+            mode: CaptureMode::Plain,
         })?;
         match resp {
             DaemonMessage::CaptureOutput(data) if !data.is_empty() => {
@@ -195,10 +195,11 @@ pub fn capture_scrollback(name: &str, lines: usize, plain: bool) -> anyhow::Resu
     // terminal screen, which correctly handles TUI apps that redraw with
     // cursor-addressed escape sequences. Raw mode streams the PTY bytes
     // verbatim so callers can re-render them in their own terminal.
+    let mode = if plain { CaptureMode::Plain } else { CaptureMode::Raw };
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,
-        raw: !plain,
+        mode,
     })?;
     match resp {
         DaemonMessage::CaptureOutput(data) => {
@@ -224,7 +225,7 @@ pub fn capture_scrollback(name: &str, lines: usize, plain: bool) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use crate::protocol::codec::{try_read_frame_async, write_frame_async};
-    use crate::protocol::messages::{ClientMessage, DaemonMessage};
+    use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
     use crate::util::strip_ansi;
 
     /// Integration test: verify SendInput path works.
@@ -294,7 +295,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "send-test".to_string(),
                 lines: 10,
-                raw: true,
+                mode: CaptureMode::Raw,
             },
         )
         .await
@@ -380,7 +381,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "cap-active".to_string(),
                 lines: 50,
-                raw: true,
+                mode: CaptureMode::Raw,
             },
         )
         .await
@@ -455,7 +456,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "cap-dead".to_string(),
                 lines: 50,
-                raw: true,
+                mode: CaptureMode::Raw,
             },
         )
         .await
@@ -508,7 +509,7 @@ mod tests {
             &ClientMessage::CaptureScrollback {
                 name: "nonexistent".to_string(),
                 lines: 10,
-                raw: false,
+                mode: CaptureMode::Plain,
             },
         )
         .await

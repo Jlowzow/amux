@@ -1,6 +1,6 @@
 use crate::client;
-use crate::protocol::messages::{ClientMessage, DaemonMessage, SessionInfo};
-use crate::util::{ensure_daemon_running, truncate};
+use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage, SessionInfo};
+use crate::util::{ensure_daemon_running, truncate, truncate_preserving_ansi};
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -156,18 +156,25 @@ fn render_frame(sessions: &[SessionInfo], term_cols: u16, trackers: &HashMap<Str
 
 /// Render preview lines from vterm-rendered scrollback.
 ///
-/// The daemon returns the virtual-terminal screen (rendered mode), which is
-/// already clean UTF-8 with ANSI sequences and control chars consumed by the
-/// emulator. We preserve the bytes verbatim so unicode glyphs used by TUI
-/// apps (box-drawing, progress bars, spinners) survive — an aggressive
-/// ASCII-only sanitize would blank most of the preview.
+/// The daemon returns the virtual-terminal screen with SGR color codes
+/// preserved but cursor positioning stripped — bytes can be written to any
+/// column on the terminal and will appear correctly colored. Truncation is
+/// ANSI-aware so escape sequences are kept intact while the visible width
+/// is clamped to `max_cols`. A trailing SGR reset is appended to each line
+/// so a colored background does not bleed past the preview pane.
 fn render_preview(raw: &[u8], max_lines: usize, max_cols: usize) -> Vec<String> {
     let text = String::from_utf8_lossy(raw);
     let all_lines: Vec<&str> = text.lines().collect();
     let start = all_lines.len().saturating_sub(max_lines);
     all_lines[start..]
         .iter()
-        .map(|l| truncate(l, max_cols))
+        .map(|l| {
+            let mut truncated = truncate_preserving_ansi(l, max_cols);
+            // Ensure each preview line ends clean so selection/summary rows
+            // below aren't rendered in a left-over fg/bg.
+            truncated.push_str("\x1b[0m");
+            truncated
+        })
         .collect()
 }
 
@@ -553,13 +560,13 @@ fn fetch_sessions() -> anyhow::Result<Vec<SessionInfo>> {
 }
 
 fn fetch_scrollback(name: &str, lines: usize) -> anyhow::Result<Vec<u8>> {
-    // Ask for the rendered virtual-terminal screen so TUI apps (which draw
-    // with cursor-addressed escape sequences) preview correctly. The raw
-    // byte stream would yield garbled fragments after naive ANSI stripping.
+    // Formatted mode: rendered screen with SGR color codes preserved, cursor
+    // positioning stripped. This lets the preview show the target's colors
+    // (e.g. claude's UI) rather than monochrome text.
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,
-        raw: false,
+        mode: CaptureMode::Formatted,
     })?;
     match resp {
         DaemonMessage::CaptureOutput(data) => Ok(data),
@@ -852,25 +859,39 @@ mod tests {
         assert_eq!(clamp_selection(5, 0), 0);
     }
 
+    /// Every preview line ends with an SGR reset so a colored background
+    /// from the previous line cannot leak into the surrounding pane.
+    const RESET: &str = "\x1b[0m";
+
     #[test]
     fn test_render_preview_plain_text() {
         let raw = b"line one\nline two\nline three\n";
         let result = render_preview(raw, 10, 80);
-        assert_eq!(result, vec!["line one", "line two", "line three"]);
+        assert_eq!(
+            result,
+            vec![
+                format!("line one{}", RESET),
+                format!("line two{}", RESET),
+                format!("line three{}", RESET),
+            ]
+        );
     }
 
     #[test]
     fn test_render_preview_limits_lines() {
         let raw = b"a\nb\nc\nd\ne\n";
         let result = render_preview(raw, 3, 80);
-        assert_eq!(result, vec!["c", "d", "e"]);
+        assert_eq!(
+            result,
+            vec![format!("c{}", RESET), format!("d{}", RESET), format!("e{}", RESET)]
+        );
     }
 
     #[test]
     fn test_render_preview_truncates_wide_lines() {
         let raw = b"this is a very long line that should be truncated\n";
         let result = render_preview(raw, 10, 20);
-        assert_eq!(result, vec!["this is a very long\u{2026}"]);
+        assert_eq!(result, vec![format!("this is a very long\u{2026}{}", RESET)]);
     }
 
     #[test]
@@ -888,8 +909,40 @@ mod tests {
         let result = render_preview(raw, 10, 80);
         assert_eq!(
             result,
-            vec!["│ Opus 4.7 │", "────────", "█░░░░ 10%"]
+            vec![
+                format!("│ Opus 4.7 │{}", RESET),
+                format!("────────{}", RESET),
+                format!("█░░░░ 10%{}", RESET),
+            ]
         );
+    }
+
+    #[test]
+    fn test_render_preview_preserves_sgr_colors() {
+        // Input with SGR color codes should have them preserved in the
+        // rendered preview output — that's the whole point.
+        let raw = b"\x1b[31mred text\x1b[0m normal\n";
+        let result = render_preview(raw, 10, 80);
+        assert_eq!(result.len(), 1);
+        let line = &result[0];
+        assert!(line.contains("\x1b[31m"), "missing red SGR: {:?}", line);
+        assert!(line.contains("red text"), "missing text: {:?}", line);
+        assert!(line.ends_with(RESET), "must end with reset: {:?}", line);
+    }
+
+    #[test]
+    fn test_render_preview_truncates_past_sgr_codes() {
+        // SGR codes don't consume visible width; truncation must still
+        // clamp the visible chars and keep the escapes intact.
+        let raw = b"\x1b[31mabcdefghij\x1b[0m\n";
+        let result = render_preview(raw, 10, 5);
+        assert_eq!(result.len(), 1);
+        let line = &result[0];
+        // 4 visible chars + ellipsis = 5 visible chars.
+        assert!(line.contains("\x1b[31m"));
+        assert!(line.contains("abcd"));
+        assert!(line.contains('…'));
+        assert!(!line.contains("efgh"), "must not contain dropped content: {:?}", line);
     }
 
     #[test]

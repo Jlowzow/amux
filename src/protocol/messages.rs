@@ -43,16 +43,15 @@ pub enum ClientMessage {
     HasSession {
         name: String,
     },
-    /// Capture session scrollback. When `raw` is true the daemon returns the
-    /// raw PTY byte stream (ANSI, cursor sequences, and all); when false
-    /// (the default) the daemon returns the rendered virtual-terminal screen
-    /// as plain UTF-8 text. Rendering produces correct output for TUI apps
-    /// that use cursor movement (CSI H, CSI 2J, etc.) to redraw in place;
-    /// stripping ANSI from the raw stream would yield garbled fragments.
+    /// Capture session scrollback in one of three modes (see `CaptureMode`).
+    /// Plain and Formatted both return the rendered virtual-terminal screen
+    /// (correct for TUI apps that use cursor movement to redraw in place);
+    /// Formatted additionally preserves SGR color/attribute codes, while
+    /// Plain strips them. Raw returns the raw PTY byte stream.
     CaptureScrollback {
         name: String,
         lines: usize,
-        raw: bool,
+        mode: CaptureMode,
     },
     SetEnv {
         name: String,
@@ -138,6 +137,19 @@ pub enum DaemonMessage {
         session: String,
         exit_code: Option<i32>,
     },
+}
+
+/// Scrollback capture mode. See `ClientMessage::CaptureScrollback`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Raw PTY byte stream — ANSI and cursor sequences included verbatim.
+    Raw,
+    /// Rendered virtual-terminal screen as plain UTF-8 text; no escape codes.
+    Plain,
+    /// Rendered virtual-terminal screen with SGR (color/attribute) codes
+    /// preserved but cursor positioning stripped. Intended for callers that
+    /// want colored output but place the cursor themselves.
+    Formatted,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

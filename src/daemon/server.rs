@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::daemon::registry::Registry;
 use crate::protocol::codec::{try_read_frame_async, write_frame_async};
-use crate::protocol::messages::{ClientMessage, DaemonMessage};
+use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
 
 pub async fn run_server(listener: UnixListener, shutdown_tx: broadcast::Sender<()>) {
     let registry = Arc::new(Mutex::new(Registry::new()));
@@ -185,25 +185,25 @@ async fn handle_connection(
                 let _ =
                     write_frame_async(&mut writer, &DaemonMessage::SessionExists(exists)).await;
             }
-            ClientMessage::CaptureScrollback { name, lines, raw } => {
+            ClientMessage::CaptureScrollback { name, lines, mode } => {
                 let reg = registry.lock().await;
                 if let Some(session) = reg.get(&name) {
-                    let data = if raw {
-                        // Raw mode: return the raw PTY byte stream.
-                        session
+                    let data = match mode {
+                        CaptureMode::Raw => session
                             .scrollback
                             .lock()
                             .map(|sb| sb.last_lines(lines))
-                            .unwrap_or_default()
-                    } else {
-                        // Rendered mode: return the virtual-terminal screen
-                        // contents. Correct for TUI apps that draw with
-                        // cursor-addressed control sequences.
-                        session
+                            .unwrap_or_default(),
+                        CaptureMode::Plain => session
                             .vterm
                             .lock()
                             .map(|vt| vt.rendered_last_lines(lines).into_bytes())
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        CaptureMode::Formatted => session
+                            .vterm
+                            .lock()
+                            .map(|vt| vt.rendered_last_lines_formatted(lines))
+                            .unwrap_or_default(),
                     };
                     let _ =
                         write_frame_async(&mut writer, &DaemonMessage::CaptureOutput(data)).await;

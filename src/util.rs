@@ -269,9 +269,97 @@ pub(crate) fn truncate(s: &str, max_width: usize) -> String {
     }
 }
 
+/// Truncate a string to `max_width` *visible* characters while keeping ANSI
+/// CSI (escape) sequences intact. SGR codes, which have zero visible width,
+/// pass through verbatim; printable chars count toward the width budget. If
+/// any visible chars are dropped, an ellipsis replaces the last kept char.
+pub(crate) fn truncate_preserving_ansi(s: &str, max_width: usize) -> String {
+    let mut visible_count = 0usize;
+    // Walk char by char, tracking byte offsets so we can slice the original
+    // string at a char boundary (the whole string is UTF-8).
+    let mut char_iter = s.char_indices().peekable();
+    let mut truncate_byte_end: Option<usize> = None;
+    let mut last_visible_byte_range: Option<(usize, usize)> = None;
+
+    while let Some(&(idx, ch)) = char_iter.peek() {
+        if ch == '\x1b' {
+            // Copy the whole escape sequence verbatim — determine its length.
+            // Supports CSI (ESC [) with parameter/intermediate/final bytes.
+            let esc_start = idx;
+            char_iter.next();
+            if let Some(&(_, next)) = char_iter.peek() {
+                if next == '[' {
+                    char_iter.next();
+                    // Scan params (0x30-0x3F) + intermediates (0x20-0x2F) + final (0x40-0x7E).
+                    while let Some(&(_, c)) = char_iter.peek() {
+                        let b = c as u32;
+                        if (0x30..=0x3F).contains(&b) {
+                            char_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    while let Some(&(_, c)) = char_iter.peek() {
+                        let b = c as u32;
+                        if (0x20..=0x2F).contains(&b) {
+                            char_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(&(_, c)) = char_iter.peek() {
+                        let b = c as u32;
+                        if (0x40..=0x7E).contains(&b) {
+                            char_iter.next();
+                        }
+                    }
+                } else {
+                    // ESC followed by a single char — consume both.
+                    char_iter.next();
+                }
+            }
+            let _ = esc_start; // bounds tracked via char_iter
+            continue;
+        }
+        // A visible character.
+        if visible_count >= max_width {
+            truncate_byte_end = Some(idx);
+            break;
+        }
+        visible_count += 1;
+        let char_end = idx + ch.len_utf8();
+        last_visible_byte_range = Some((idx, char_end));
+        char_iter.next();
+    }
+
+    match truncate_byte_end {
+        None => s.to_string(),
+        Some(end) => {
+            // We dropped at least one visible char. Replace the last visible
+            // char with an ellipsis (when there's budget to do so).
+            if max_width == 0 {
+                return String::new();
+            }
+            if let Some((last_start, _)) = last_visible_byte_range {
+                let mut out = String::with_capacity(last_start + 3);
+                out.push_str(&s[..last_start]);
+                out.push('…');
+                // Reset any lingering SGR introduced before the drop.
+                // The caller already appends a final reset, so we don't
+                // emit one here to avoid double-resets.
+                out
+            } else {
+                // No visible chars fit — return empty, minus any escapes.
+                let _ = end;
+                String::new()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, clean_control_chars, truncate};
+    use super::{strip_ansi, clean_control_chars, truncate, truncate_preserving_ansi};
 
     #[test]
     fn test_strip_ansi_plain_text() {
@@ -429,5 +517,70 @@ mod tests {
     fn test_truncate_very_small_max() {
         assert_eq!(truncate("hello", 3), "he…");
         assert_eq!(truncate("hello", 1), "h");
+    }
+
+    // --- truncate_preserving_ansi ---
+
+    #[test]
+    fn test_truncate_preserving_ansi_no_escapes_short() {
+        assert_eq!(truncate_preserving_ansi("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_no_escapes_long() {
+        let result = truncate_preserving_ansi("hello world", 5);
+        // 4 visible chars + "…"
+        assert_eq!(result, "hell…");
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_keeps_sgr_intact() {
+        // SGR codes have zero visible width and must survive truncation.
+        let input = "\x1b[31mhello\x1b[0m world";
+        let result = truncate_preserving_ansi(input, 5);
+        // Visible is "hello world" (11 chars); truncated to 5 -> "hell…",
+        // with the opening red SGR code preserved verbatim.
+        assert!(result.starts_with("\x1b[31m"), "got: {:?}", result);
+        assert!(result.ends_with('…'), "got: {:?}", result);
+        // Should contain 4 visible chars from "hello".
+        assert!(result.contains("hell"), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_below_limit_preserves_all() {
+        let input = "\x1b[1;32mhi\x1b[0m";
+        // Visible is 2 chars "hi" — fits in 10, so full input returned.
+        assert_eq!(truncate_preserving_ansi(input, 10), input);
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_multiple_sgr_segments() {
+        // Two colored segments totalling 6 visible chars, truncated to 4.
+        let input = "\x1b[31mABC\x1b[0m\x1b[32mXYZ\x1b[0m";
+        let result = truncate_preserving_ansi(input, 4);
+        // First three visible chars ABC (with red SGR in front), then an
+        // ellipsis replaces 4th visible char (X). The second SGR code
+        // appearing between ABC and XYZ should be copied through because
+        // it sits between visible chars.
+        assert!(result.starts_with("\x1b[31m"), "got: {:?}", result);
+        assert!(result.contains("ABC"), "got: {:?}", result);
+        assert!(result.ends_with('…'), "got: {:?}", result);
+        // The "XYZ" must NOT be present — it's all past the budget.
+        assert!(!result.contains('X'), "got: {:?}", result);
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_zero_width() {
+        assert_eq!(truncate_preserving_ansi("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_preserving_ansi_unicode_counts_as_one() {
+        // Unicode box-drawing chars occupy one column each.
+        let input = "│ foo │ bar";
+        let result = truncate_preserving_ansi(input, 5);
+        // 4 visible chars + ellipsis.
+        assert_eq!(result.chars().count(), 5);
+        assert!(result.ends_with('…'));
     }
 }

@@ -7,7 +7,10 @@
 //!
 //! `VirtualTerminal` feeds bytes into a vt100 parser which maintains a
 //! rendered screen grid. `rendered_screen()` returns that grid as plain
-//! text — the same content a user would see on a real terminal.
+//! text; `rendered_screen_formatted()` returns it with SGR color/attribute
+//! codes preserved (but no cursor positioning).
+
+use vt100::Color;
 
 pub struct VirtualTerminal {
     parser: vt100::Parser,
@@ -52,6 +55,201 @@ impl VirtualTerminal {
             .collect();
         let start = lines.len().saturating_sub(n);
         lines[start..].join("\n")
+    }
+
+    /// Return the last `n` non-empty lines of the rendered screen, with SGR
+    /// (color/attribute) escape codes preserved. No cursor-positioning codes
+    /// are emitted — callers are responsible for placing the cursor.
+    ///
+    /// Each returned line begins with SGR reset so state does not bleed in
+    /// from previous output; lines are separated by `\n`. The sequence ends
+    /// with SGR reset so callers need not emit one themselves.
+    pub fn rendered_last_lines_formatted(&self, n: usize) -> Vec<u8> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        // Text per row, used to trim trailing blank rows the same way
+        // rendered_last_lines does.
+        let mut row_texts: Vec<String> = Vec::with_capacity(rows as usize);
+        for r in 0..rows {
+            let mut text = String::new();
+            for c in 0..cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    if !cell.is_wide_continuation() {
+                        text.push_str(cell.contents());
+                    }
+                }
+            }
+            row_texts.push(text);
+        }
+        // Skip blank rows (matches rendered_last_lines's filter(|l| !l.trim().is_empty())).
+        let non_blank: Vec<u16> = row_texts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(i, _)| i as u16)
+            .collect();
+        if non_blank.is_empty() {
+            return Vec::new();
+        }
+        let start = non_blank.len().saturating_sub(n);
+        let selected = &non_blank[start..];
+
+        let mut out = Vec::new();
+        for (i, &row_idx) in selected.iter().enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            write_row_sgr(&mut out, screen, row_idx, cols);
+        }
+        // Final reset so downstream writes aren't colored.
+        out.extend_from_slice(b"\x1b[0m");
+        out
+    }
+}
+
+/// SGR-relevant attributes of a cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SgrAttrs {
+    fg: Color,
+    bg: Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl SgrAttrs {
+    fn default_state() -> Self {
+        Self {
+            fg: Color::Default,
+            bg: Color::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }
+    }
+
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+}
+
+/// Emit an SGR sequence that sets the terminal to `attrs`. Always emits a
+/// reset first so the result is absolute rather than diff-based — simpler
+/// than tracking the previous state for correctness.
+fn emit_sgr(out: &mut Vec<u8>, attrs: &SgrAttrs) {
+    let mut params: Vec<String> = vec!["0".to_string()];
+    if attrs.bold {
+        params.push("1".to_string());
+    }
+    if attrs.dim {
+        params.push("2".to_string());
+    }
+    if attrs.italic {
+        params.push("3".to_string());
+    }
+    if attrs.underline {
+        params.push("4".to_string());
+    }
+    if attrs.inverse {
+        params.push("7".to_string());
+    }
+    match attrs.fg {
+        Color::Default => {}
+        Color::Idx(i) if i < 8 => params.push((30 + i as u16).to_string()),
+        Color::Idx(i) if i < 16 => params.push((90 + (i as u16 - 8)).to_string()),
+        Color::Idx(i) => {
+            params.push("38".to_string());
+            params.push("5".to_string());
+            params.push(i.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            params.push("38".to_string());
+            params.push("2".to_string());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
+    match attrs.bg {
+        Color::Default => {}
+        Color::Idx(i) if i < 8 => params.push((40 + i as u16).to_string()),
+        Color::Idx(i) if i < 16 => params.push((100 + (i as u16 - 8)).to_string()),
+        Color::Idx(i) => {
+            params.push("48".to_string());
+            params.push("5".to_string());
+            params.push(i.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            params.push("48".to_string());
+            params.push("2".to_string());
+            params.push(r.to_string());
+            params.push(g.to_string());
+            params.push(b.to_string());
+        }
+    }
+    out.extend_from_slice(b"\x1b[");
+    out.extend_from_slice(params.join(";").as_bytes());
+    out.push(b'm');
+}
+
+/// Write one row to `out` as SGR-formatted bytes. Trailing blank cells at
+/// the end of the row are dropped so a colored background does not extend
+/// past the last visible character.
+fn write_row_sgr(out: &mut Vec<u8>, screen: &vt100::Screen, row: u16, cols: u16) {
+    // Find the last column that has visible content so we don't emit
+    // trailing blank cells (which would paint the background past text).
+    let mut last_content_col: Option<u16> = None;
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(row, c) {
+            if cell.has_contents() && !cell.is_wide_continuation() {
+                let contents = cell.contents();
+                if !contents.is_empty() && contents != " " {
+                    last_content_col = Some(c);
+                }
+            }
+        }
+    }
+    // Always start each line with a reset so no prior-line state leaks.
+    let mut current = SgrAttrs::default_state();
+    out.extend_from_slice(b"\x1b[0m");
+    let limit = match last_content_col {
+        Some(c) => c + 1,
+        None => return,
+    };
+    for c in 0..limit {
+        let cell = match screen.cell(row, c) {
+            Some(cell) => cell,
+            None => break,
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let new_attrs = SgrAttrs::from_cell(cell);
+        if new_attrs != current {
+            emit_sgr(out, &new_attrs);
+            current = new_attrs;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            out.push(b' ');
+        } else {
+            out.extend_from_slice(contents.as_bytes());
+        }
     }
 }
 
@@ -203,5 +401,130 @@ mod tests {
         // After resize the content should still be queryable without panic.
         let screen = vt.rendered_screen();
         assert!(screen.starts_with("hello"));
+    }
+
+    // ---- rendered_last_lines_formatted: SGR preservation ----
+
+    fn strip_escapes(bytes: &[u8]) -> String {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7E).contains(&b) {
+                        break;
+                    }
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn formatted_plain_text_has_no_cursor_movement_codes() {
+        // Plain text in should produce plain text out, with only SGR reset
+        // wrappers added — no cursor positioning escapes that would move
+        // the cursor away from where a caller placed it.
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"hello world");
+        let out = vt.rendered_last_lines_formatted(5);
+        // Check no cursor positioning — CSI H, CSI A, CSI C, etc.
+        let text = String::from_utf8_lossy(&out).to_string();
+        for bad in ["\x1b[H", "\x1b[1;1H", "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[J", "\x1b[K"] {
+            assert!(!text.contains(bad), "found cursor code {:?} in: {:?}", bad, text);
+        }
+        assert_eq!(strip_escapes(&out), "hello world");
+    }
+
+    #[test]
+    fn formatted_preserves_foreground_color() {
+        // Process input with ANSI red color. Verify the output contains an
+        // SGR sequence setting red (31) and the text.
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[31mred text\x1b[0m");
+        let out = vt.rendered_last_lines_formatted(5);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("red text"), "missing text: {:?}", text);
+        // Look for any SGR sequence containing ";31" or "[31" — standard red fg.
+        assert!(
+            text.contains("\x1b[") && (text.contains(";31") || text.contains("[31")) ,
+            "expected SGR red code in {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn formatted_preserves_bold() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[1mbold\x1b[0m plain");
+        let out = vt.rendered_last_lines_formatted(5);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("bold"));
+        // Bold attribute SGR is 1.
+        assert!(
+            text.contains("\x1b[0;1") || text.contains(";1m") || text.contains("[1m"),
+            "expected bold SGR in {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn formatted_ends_with_reset() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[31mred\x1b[0m");
+        let out = vt.rendered_last_lines_formatted(5);
+        // Output should end with an SGR reset so it doesn't color subsequent output.
+        assert!(
+            out.ends_with(b"\x1b[0m"),
+            "expected trailing reset, got tail: {:?}",
+            &out[out.len().saturating_sub(8)..]
+        );
+    }
+
+    #[test]
+    fn formatted_n_zero_returns_empty() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[31mred\x1b[0m");
+        assert!(vt.rendered_last_lines_formatted(0).is_empty());
+    }
+
+    #[test]
+    fn formatted_multiple_lines_separated_by_newlines() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"line1\r\nline2\r\nline3\r\n");
+        let out = vt.rendered_last_lines_formatted(10);
+        let plain = strip_escapes(&out);
+        assert_eq!(plain, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn formatted_returns_only_last_n_non_blank_lines() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"a\r\nb\r\nc\r\nd\r\ne\r\n");
+        let out = vt.rendered_last_lines_formatted(2);
+        let plain = strip_escapes(&out);
+        assert_eq!(plain, "d\ne");
+    }
+
+    #[test]
+    fn formatted_consumes_cursor_redraws_like_plain_does() {
+        // The same TUI-redraw scenario as `tui_redraw_sequence_matches_real_output`
+        // but via the formatted path — garbage must be gone, FINAL must remain,
+        // and there must be no leftover cursor-positioning escapes.
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"garbage line 1\r\n");
+        vt.process(b"more garbage\r\n");
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(b"FINAL: hello\r\n");
+        let out = vt.rendered_last_lines_formatted(10);
+        let plain = strip_escapes(&out);
+        assert!(!plain.contains("garbage"), "got: {:?}", plain);
+        assert!(plain.contains("FINAL: hello"), "got: {:?}", plain);
     }
 }
