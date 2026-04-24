@@ -481,8 +481,9 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
 
         stdout.flush()?;
 
-        // Wait for input or timeout (poll every 2 seconds)
-        if event::poll(Duration::from_secs(2))? {
+        // Wait for input or timeout. Poll at 100ms so key presses feel
+        // responsive and the session/activity data refreshes at ~10Hz.
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
                 let action = handle_key(code, modifiers, &sorted, &mut selected);
                 match action {
