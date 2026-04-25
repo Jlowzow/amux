@@ -72,3 +72,21 @@ Run `cargo test` after each step to confirm state. Tests go in the same file as 
 - Attach uses `Ctrl+B` as prefix key (like tmux's `Ctrl+B`), `Ctrl+B d` to detach
 - Server spawns a reaper task every 30s to clean dead sessions
 - Logs go to `/tmp/amux-{uid}/daemon.log` (tracing with env filter)
+
+## Multi-agent orchestration (conductor)
+
+This repo dispatches beads to parallel worker agents using **conductor** (`~/Code/conductor`), which sits on top of amux + a file-based mailbox at `/tmp/conductor-mail/`.
+
+To enter orchestrator mode in this session, run the `/conductor` slash command — it loads the playbook from `~/Code/conductor/templates/CLAUDE.md`. The skill makes you the orchestrator: you survey `br ready`, assign beads via `conductor assign <Name> "..."`, and spawn workers via `conductor spawn <Name> /Users/claude/Code/amux`. Workers run `claude --dangerously-skip-permissions` in their own amux session and report DONE/FAIL back via `mail send orchestrator ...`.
+
+Key files:
+- `~/Code/conductor/conductor` — `init|spawn|assign|status|kill|mail` wrapper around amux.
+- `~/Code/conductor/templates/CLAUDE.md` — the orchestrator playbook (canonical).
+- `~/Code/conductor/.claude/agents/worker.md` — worker subagent definition; encodes the "mail orchestrator, never the user" rule.
+
+House rules for orchestration in this repo:
+- **Workers run in their own git worktree** under `.worktrees/<bd-id>` on a `<bd-id>-work` branch. Never spawn two agents in the same tree.
+- **Workers commit before any `kill-server` or `cargo build`.** Agents working on `src/daemon/**` can self-kill via daemon restart and lose uncommitted work otherwise.
+- **One bead per worker.** Don't double-book. If beads touch overlapping files, dispatch sequentially.
+- **The worktree's `.beads/` is empty by design.** Workers must use `br --db /Users/claude/Code/amux/.beads/beads.db show <bd-id>` to read beads from inside a worktree.
+- **Don't restart the amux daemon while workers are alive** — every session shares one daemon.
