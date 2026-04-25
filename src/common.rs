@@ -1,10 +1,31 @@
 use std::io;
 use std::path::PathBuf;
 
+/// Environment variable that selects an amux instance. When set to a
+/// non-empty value, every runtime path is suffixed with `-{instance}`,
+/// giving a fully separate daemon, socket, pid file, and session
+/// registry. Used to run multiple orchestrators (e.g. one per project)
+/// on the same machine without their workers showing up in each
+/// other's `amux ls`.
+pub const INSTANCE_ENV: &str = "AMUX_INSTANCE";
+
 /// Return the directory used for amux runtime files.
+///
+/// Honors the `AMUX_INSTANCE` env var: when set to a non-empty value,
+/// the directory becomes `/tmp/amux-{uid}-{instance}`. Otherwise the
+/// default `/tmp/amux-{uid}` is used.
 pub fn runtime_dir() -> PathBuf {
+    runtime_dir_for(std::env::var(INSTANCE_ENV).ok().as_deref())
+}
+
+/// Pure helper: compute the runtime dir for an explicit instance name.
+/// `None` and `Some("")` both yield the default (un-suffixed) path.
+pub fn runtime_dir_for(instance: Option<&str>) -> PathBuf {
     let uid = nix::unistd::getuid();
-    PathBuf::from(format!("/tmp/amux-{}", uid))
+    match instance {
+        Some(name) if !name.is_empty() => PathBuf::from(format!("/tmp/amux-{}-{}", uid, name)),
+        _ => PathBuf::from(format!("/tmp/amux-{}", uid)),
+    }
 }
 
 /// Return the path to the server socket.
@@ -184,6 +205,35 @@ mod tests {
         if comm.starts_with("amux") {
             assert!(pid_is_amux(pid));
         }
+    }
+
+    #[test]
+    fn runtime_dir_for_default_when_no_instance() {
+        let uid = nix::unistd::getuid();
+        let expected = PathBuf::from(format!("/tmp/amux-{}", uid));
+        assert_eq!(runtime_dir_for(None), expected);
+        assert_eq!(runtime_dir_for(Some("")), expected);
+    }
+
+    #[test]
+    fn runtime_dir_for_named_instance_is_suffixed() {
+        let uid = nix::unistd::getuid();
+        assert_eq!(
+            runtime_dir_for(Some("projA")),
+            PathBuf::from(format!("/tmp/amux-{}-projA", uid))
+        );
+    }
+
+    #[test]
+    fn runtime_dir_for_two_instances_are_distinct() {
+        // Different instance names must never collide — that's the
+        // whole point of the feature.
+        let a = runtime_dir_for(Some("alice"));
+        let b = runtime_dir_for(Some("bob"));
+        assert_ne!(a, b);
+        // Both must differ from the default too.
+        assert_ne!(runtime_dir_for(None), a);
+        assert_ne!(runtime_dir_for(None), b);
     }
 
     #[test]

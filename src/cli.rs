@@ -3,6 +3,15 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "amux", about = "AI Agent Multiplexer", version)]
 pub struct Cli {
+    /// Select an amux instance: every runtime file (socket, pid, log)
+    /// lives under /tmp/amux-{uid}-{instance}, giving this invocation
+    /// its own daemon and session registry. Equivalent to setting the
+    /// `AMUX_INSTANCE` env var; the flag wins when both are present.
+    /// Use this to run multiple orchestrators side-by-side without
+    /// their sessions showing up in each other's `amux ls`.
+    #[arg(short = 'I', long = "instance", global = true)]
+    pub instance: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

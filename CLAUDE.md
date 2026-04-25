@@ -41,11 +41,15 @@ src/
 
 ## IPC Pattern
 
-1. Daemon listens on Unix socket at `/tmp/amux-{uid}/server.sock`
+1. Daemon listens on Unix socket at `/tmp/amux-{uid}/server.sock` (or `/tmp/amux-{uid}-{instance}/server.sock` when an instance is selected — see below).
 2. Client sends `ClientMessage`, daemon replies with `DaemonMessage`
 3. Wire format: 4-byte big-endian length prefix + bincode payload (max 1MB)
 4. Simple commands (new, ls, kill, ping) use sync request/response (`client::request()`)
 5. Attach mode upgrades to async bidirectional streaming (tokio)
+
+## Instances
+
+By default amux runs a single per-uid daemon. Pass `--instance <name>` (or set `AMUX_INSTANCE=<name>`) to give an invocation its own daemon, socket, pid file, and session registry under `/tmp/amux-{uid}-{name}/`. Used to run multiple orchestrators (e.g. one per project) side-by-side without their workers showing up in each other's `amux ls`. The flag wins over the env var when both are set; `main.rs` propagates the flag into `AMUX_INSTANCE` before dispatch so forked daemon children and any nested `amux` calls in scripts see the same instance.
 
 ## Adding a New Subcommand
 
