@@ -152,6 +152,41 @@ impl Registry {
         self.sessions.get_mut(name)
     }
 
+    /// Re-probe each session's child via `waitpid(WNOHANG)` and reap any
+    /// whose child has exited. This is intended to be called after the
+    /// daemon detects it has been suspended (macOS App Nap, system sleep)
+    /// and wants to catch up on child-death events that may have been
+    /// missed while the runtime wasn't scheduled.
+    ///
+    /// For each child found exited, records the exit code and `died_at`
+    /// (only if not already set, to avoid clobbering values written by the
+    /// session's own io_loop). Returns the names of sessions whose
+    /// children were reaped here.
+    pub fn probe_after_resume(&self) -> Vec<String> {
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        let now = std::time::SystemTime::now();
+        let mut reaped = Vec::new();
+        for (name, session) in &self.sessions {
+            let code = match waitpid(session.child_pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => Some(code),
+                Ok(WaitStatus::Signaled(_, sig, _)) => Some(128 + sig as i32),
+                _ => continue, // Still alive, already reaped, or error.
+            };
+            if let Ok(mut ec) = session.exit_code.lock() {
+                if ec.is_none() {
+                    *ec = code;
+                }
+            }
+            if let Ok(mut da) = session.died_at.lock() {
+                if da.is_none() {
+                    *da = Some(now);
+                }
+            }
+            reaped.push(name.clone());
+        }
+        reaped
+    }
+
     /// Remove dead sessions that have been dead for longer than the retention period.
     /// Dead sessions are kept for 5 minutes so their exit codes remain visible in `ls`.
     pub fn reap_dead(&mut self) -> Vec<String> {
@@ -361,6 +396,72 @@ mod tests {
         let info = reg.info("info-test").unwrap();
         assert_eq!(info.name, "info-test");
         assert!(info.alive);
+    }
+
+    #[tokio::test]
+    async fn test_probe_after_resume_reaps_exited_child() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("probe-test".to_string()),
+            // `true` exits with status 0 immediately.
+            &["true".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Wait for the child to actually exit. Without a yield the
+        // watchdog probe might race the child's own setup.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // is_alive() uses kill -0, which returns OK for zombies, so
+            // it isn't a reliable signal — break unconditionally after
+            // a short wait and let probe_after_resume handle it.
+            break;
+        }
+        // Give the child time to exit and become a zombie.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let reaped = reg.probe_after_resume();
+        // Either we reaped it here, or the io_loop already did — both are
+        // legal outcomes. What matters is that exit_code is populated.
+        let session = reg.get("probe-test").expect("session still present");
+        // Wait briefly for either path to populate exit_code.
+        let mut got_code = None;
+        for _ in 0..50 {
+            if let Ok(ec) = session.exit_code.lock() {
+                if ec.is_some() {
+                    got_code = *ec;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(got_code, Some(0), "expected exit code 0, reaped={:?}", reaped);
+    }
+
+    #[tokio::test]
+    async fn test_probe_after_resume_skips_alive_child() {
+        let mut reg = Registry::new();
+        reg.create(
+            Some("probe-alive".to_string()),
+            &["sleep".to_string(), "60".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+        let reaped = reg.probe_after_resume();
+        assert!(
+            reaped.is_empty(),
+            "alive child must not be reaped: {:?}",
+            reaped
+        );
+        // Cleanup.
+        let _ = reg.kill("probe-alive");
     }
 
     #[tokio::test]

@@ -59,8 +59,8 @@ fn map_io_timeout(e: anyhow::Error, op: &str) -> anyhow::Error {
     });
     if is_timeout {
         anyhow::anyhow!(
-            "daemon did not respond ({} timed out after {}s) — it may be hung; \
-             try: amux kill-server && amux start-server",
+            "daemon unresponsive (possibly suspended; was the system asleep?) — \
+             {} timed out after {}s; try: amux kill-server && amux start-server",
             op,
             REQUEST_TIMEOUT.as_secs()
         )
@@ -128,8 +128,8 @@ mod tests {
         assert!(result.is_err(), "expected timeout error");
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
-            err_msg.contains("did not respond") || err_msg.contains("hung"),
-            "expected hung-daemon message, got: {}",
+            err_msg.contains("unresponsive") && err_msg.contains("suspended"),
+            "expected unresponsive/suspended message, got: {}",
             err_msg
         );
         assert!(

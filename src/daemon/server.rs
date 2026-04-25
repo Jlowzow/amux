@@ -11,16 +11,13 @@ pub async fn run_server(listener: UnixListener, shutdown_tx: broadcast::Sender<(
     let registry = Arc::new(Mutex::new(Registry::new()));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
-    // Spawn a reaper task.
-    let registry_reaper = registry.clone();
+    // Spawn the suspension-aware watchdog. It detects macOS App Nap /
+    // system sleep via monotonic-clock gaps, reaps zombie children that
+    // exited during the suspension, and runs the periodic dead-session
+    // sweep that the previous reaper handled.
+    let registry_watchdog = registry.clone();
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let dead = registry_reaper.lock().await.reap_dead();
-            for name in &dead {
-                tracing::info!("reaped dead session: {}", name);
-            }
-        }
+        crate::daemon::watchdog::run(registry_watchdog).await;
     });
 
     loop {

@@ -409,17 +409,24 @@ impl Session {
             }
         }
 
-        // Wait for child to exit and capture exit code.
+        // Wait for child to exit and capture exit code. The watchdog (see
+        // server.rs) may have already reaped the child after a system
+        // suspension; in that case waitpid here returns ECHILD and `code`
+        // is None. Preserve the watchdog's value rather than overwriting.
         let code = match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
             Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => Some(code),
             Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => Some(128 + sig as i32),
             _ => None,
         };
         if let Ok(mut ec) = exit_code.lock() {
-            *ec = code;
+            if ec.is_none() {
+                *ec = code;
+            }
         }
         if let Ok(mut da) = died_at.lock() {
-            *da = Some(std::time::SystemTime::now());
+            if da.is_none() {
+                *da = Some(std::time::SystemTime::now());
+            }
         }
 
         // Signal that the io_loop has exited (session is effectively dead).

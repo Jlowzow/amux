@@ -2,6 +2,7 @@ pub mod registry;
 pub mod server;
 pub mod session;
 pub mod vterm;
+pub mod watchdog;
 
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -60,10 +61,37 @@ pub fn fork_daemon() -> anyhow::Result<()> {
             // Set up tracing to a log file.
             setup_tracing(&run_dir);
 
+            // On macOS, ask the kernel to keep us scheduled. App Nap is
+            // applied per-app and primarily targets foreground apps with
+            // a Dock entry, but the practical risk for amux is system
+            // idle sleep (closed lid, inactive desktop) — `caffeinate -i`
+            // suppresses that and exits when our pid does.
+            #[cfg(target_os = "macos")]
+            disable_app_nap_macos(pid);
+
             // Now safe to create tokio runtime.
             run_daemon(sock_path);
         }
     }
+}
+
+/// Best-effort App Nap / idle-sleep opt-out for macOS.
+///
+/// We shell out to `caffeinate -i -w <pid>` rather than linking
+/// Foundation/IOKit directly: caffeinate has shipped with macOS since
+/// 10.8, the `-w` flag binds its lifetime to ours, and a missing or
+/// failing binary leaves the daemon in its previous (working) state.
+/// The watchdog still catches actual suspensions, so this is a
+/// belt-and-braces hint to the scheduler, not a correctness primitive.
+#[cfg(target_os = "macos")]
+fn disable_app_nap_macos(pid: u32) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("caffeinate")
+        .args(["-i", "-w", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn setup_tracing(run_dir: &std::path::Path) {
