@@ -440,6 +440,55 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(got_code, Some(0), "expected exit code 0, reaped={:?}", reaped);
+        // died_at should be populated whichever path reaped the child.
+        assert!(
+            session.died_at.lock().unwrap().is_some(),
+            "expected died_at to be populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_after_resume_preserves_existing_exit_code() {
+        // Invariant: probe_after_resume must not clobber an exit_code
+        // already set by the session's io_loop. Without this guard, the
+        // watchdog would race io_loop and either could overwrite the
+        // other with stale data — see the matching `if ec.is_none()`
+        // checks in registry::probe_after_resume and session::io_loop.
+        let mut reg = Registry::new();
+        reg.create(
+            Some("preserve".to_string()),
+            &["true".to_string()],
+            80,
+            24,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Wait for the child to exit and io_loop to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Inject a sentinel value as if io_loop had already recorded it.
+        let sentinel = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        {
+            let session = reg.get("preserve").expect("session present");
+            *session.exit_code.lock().unwrap() = Some(99);
+            *session.died_at.lock().unwrap() = Some(sentinel);
+        }
+
+        let _ = reg.probe_after_resume();
+
+        let session = reg.get("preserve").expect("session still present");
+        assert_eq!(
+            *session.exit_code.lock().unwrap(),
+            Some(99),
+            "probe_after_resume must not overwrite a pre-set exit_code"
+        );
+        assert_eq!(
+            *session.died_at.lock().unwrap(),
+            Some(sentinel),
+            "probe_after_resume must not overwrite a pre-set died_at"
+        );
     }
 
     #[tokio::test]
