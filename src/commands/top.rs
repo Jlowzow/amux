@@ -1,4 +1,5 @@
 use crate::client;
+use crate::common::INSTANCE_ENV;
 use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage, SessionInfo};
 use crate::util::{ensure_daemon_running, truncate, truncate_preserving_ansi};
 
@@ -90,6 +91,18 @@ fn sort_sessions(sessions: &mut [SessionInfo]) {
     sessions.sort_by(|a, b| {
         b.alive.cmp(&a.alive).then_with(|| a.name.cmp(&b.name))
     });
+}
+
+/// Format the title-row instance label.
+///
+/// Default instance (`None` or `Some("")`) returns an empty string so the
+/// title is unchanged. A named instance returns `"  [instance: <name>]"` so
+/// it can be appended to the existing title text on the same row.
+fn instance_suffix(instance: Option<&str>) -> String {
+    match instance {
+        Some(name) if !name.is_empty() => format!("  [instance: {}]", name),
+        _ => String::new(),
+    }
 }
 
 /// Build the summary line, e.g. "7 sessions (5 alive, 2 dead)".
@@ -292,6 +305,10 @@ pub fn do_top_once() -> anyhow::Result<()> {
     // Use 80 columns as default when not in a terminal
     let cols = terminal::size().map(|(c, _)| c).unwrap_or(80);
 
+    let suffix = instance_suffix(std::env::var(INSTANCE_ENV).ok().as_deref());
+    if !suffix.is_empty() {
+        println!("amux top{}", suffix);
+    }
     let output = render_snapshot(&sessions, cols, &trackers);
     println!("{}", output);
     Ok(())
@@ -367,14 +384,15 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // section to spill into another's rows.
         execute!(stdout, terminal::Clear(ClearType::All))?;
 
-        // Title
+        // Title (with optional [instance: <name>] suffix when AMUX_INSTANCE is set)
+        let suffix = instance_suffix(std::env::var(INSTANCE_ENV).ok().as_deref());
         execute!(
             stdout,
             cursor::MoveTo(0, layout.title_row),
             SetAttribute(Attribute::Bold),
             SetForegroundColor(Color::Cyan)
         )?;
-        write!(stdout, "amux top")?;
+        write!(stdout, "amux top{}", suffix)?;
         execute!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
 
         // Header row
@@ -1162,6 +1180,31 @@ mod tests {
             "expected no preview on tiny terminal, got {:?}",
             layout
         );
+    }
+
+    // --- Instance suffix helper (bd-3ri) ---
+
+    #[test]
+    fn test_instance_suffix_default_is_empty() {
+        assert_eq!(instance_suffix(None), "");
+        assert_eq!(instance_suffix(Some("")), "");
+    }
+
+    #[test]
+    fn test_instance_suffix_named_contains_label() {
+        let s = instance_suffix(Some("foo"));
+        assert!(s.contains("instance: foo"), "expected label, got {:?}", s);
+        // Default invocation must not accidentally produce this string.
+        assert!(!instance_suffix(None).contains("instance:"));
+    }
+
+    #[test]
+    fn test_instance_suffix_appends_cleanly_to_title() {
+        // The suffix is meant to sit on the same line as the title without
+        // colliding with the existing text.
+        let title = format!("amux top{}", instance_suffix(Some("projA")));
+        assert!(title.starts_with("amux top"));
+        assert!(title.contains("instance: projA"));
     }
 
     #[test]
