@@ -1,5 +1,5 @@
 use crate::client;
-use crate::common::INSTANCE_ENV;
+use crate::common::resolved_instance;
 use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage, SessionInfo};
 use crate::util::{ensure_daemon_running, truncate, truncate_preserving_ansi};
 
@@ -305,7 +305,8 @@ pub fn do_top_once() -> anyhow::Result<()> {
     // Use 80 columns as default when not in a terminal
     let cols = terminal::size().map(|(c, _)| c).unwrap_or(80);
 
-    let suffix = instance_suffix(std::env::var(INSTANCE_ENV).ok().as_deref());
+    let resolved = resolved_instance();
+    let suffix = instance_suffix(resolved.as_deref());
     if !suffix.is_empty() {
         println!("amux top{}", suffix);
     }
@@ -384,8 +385,9 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // section to spill into another's rows.
         execute!(stdout, terminal::Clear(ClearType::All))?;
 
-        // Title (with optional [instance: <name>] suffix when AMUX_INSTANCE is set)
-        let suffix = instance_suffix(std::env::var(INSTANCE_ENV).ok().as_deref());
+        // Title (with optional [instance: <name>] suffix from resolved_instance)
+        let resolved = resolved_instance();
+        let suffix = instance_suffix(resolved.as_deref());
         execute!(
             stdout,
             cursor::MoveTo(0, layout.title_row),
