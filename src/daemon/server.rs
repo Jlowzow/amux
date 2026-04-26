@@ -7,6 +7,30 @@ use crate::daemon::registry::Registry;
 use crate::protocol::codec::{try_read_frame_async, write_frame_async};
 use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
 
+/// Strip CSI escape sequences (ESC `[` ... final-byte) from `bytes`. The
+/// final byte of a CSI sequence is in the range 0x40..=0x7E. Used for
+/// `CaptureMode::Plain` to drop SGR codes after vt100-replay rendering.
+fn strip_csi_escapes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() {
+                let b = bytes[i];
+                i += 1;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub async fn run_server(listener: UnixListener, shutdown_tx: broadcast::Sender<()>) {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -191,16 +215,45 @@ async fn handle_connection(
                             .lock()
                             .map(|sb| sb.last_lines(lines))
                             .unwrap_or_default(),
-                        CaptureMode::Plain => session
-                            .vterm
-                            .lock()
-                            .map(|vt| vt.rendered_last_lines(lines).into_bytes())
-                            .unwrap_or_default(),
-                        CaptureMode::Formatted => session
-                            .vterm
-                            .lock()
-                            .map(|vt| vt.rendered_last_lines_formatted(lines))
-                            .unwrap_or_default(),
+                        // Plain and Formatted both replay the raw scrollback
+                        // ring through a temporary vt100 parser sized to fit
+                        // the requested line count. This recovers history
+                        // beyond the agent's PTY rows (e.g. for amux top's
+                        // preview pane in tall terminals — bd-pmk).
+                        CaptureMode::Plain => {
+                            let raw = session
+                                .scrollback
+                                .lock()
+                                .map(|sb| sb.contents())
+                                .unwrap_or_default();
+                            let cols = session
+                                .vterm
+                                .lock()
+                                .map(|vt| vt.size().1)
+                                .unwrap_or(80);
+                            let target_rows = (lines as u16).max(24);
+                            let formatted = crate::daemon::vterm::render_raw_scrollback_formatted(
+                                &raw, target_rows, cols, lines,
+                            );
+                            // Strip escape codes for Plain mode.
+                            strip_csi_escapes(&formatted)
+                        }
+                        CaptureMode::Formatted => {
+                            let raw = session
+                                .scrollback
+                                .lock()
+                                .map(|sb| sb.contents())
+                                .unwrap_or_default();
+                            let cols = session
+                                .vterm
+                                .lock()
+                                .map(|vt| vt.size().1)
+                                .unwrap_or(80);
+                            let target_rows = (lines as u16).max(24);
+                            crate::daemon::vterm::render_raw_scrollback_formatted(
+                                &raw, target_rows, cols, lines,
+                            )
+                        }
                     };
                     let _ =
                         write_frame_async(&mut writer, &DaemonMessage::CaptureOutput(data)).await;

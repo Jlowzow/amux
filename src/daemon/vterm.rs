@@ -34,16 +34,28 @@ impl VirtualTerminal {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
+    /// Return the emulator's current grid size as `(rows, cols)`.
+    pub fn size(&self) -> (u16, u16) {
+        self.parser.screen().size()
+    }
+
     /// Return the rendered screen as plain UTF-8 text.
     ///
     /// Trailing blank lines and per-row trailing whitespace are trimmed.
     /// The result reflects cursor-addressed screen state, not the raw byte
     /// stream — TUI app redraws (CSI H, CSI 2J, etc.) produce correct output.
+    #[allow(dead_code)]
     pub fn rendered_screen(&self) -> String {
         self.parser.screen().contents()
     }
 
     /// Return the last `n` non-empty lines of the rendered screen.
+    ///
+    /// Bounded by the live screen size (PTY rows). For history beyond the
+    /// screen — needed by `amux top`'s preview pane in tall terminals — use
+    /// `render_raw_scrollback_formatted` against the session's raw scrollback
+    /// ring buffer instead (see bd-pmk).
+    #[allow(dead_code)]
     pub fn rendered_last_lines(&self, n: usize) -> String {
         if n == 0 {
             return String::new();
@@ -64,6 +76,9 @@ impl VirtualTerminal {
     /// Each returned line begins with SGR reset so state does not bleed in
     /// from previous output; lines are separated by `\n`. The sequence ends
     /// with SGR reset so callers need not emit one themselves.
+    ///
+    /// Bounded by the live screen size; see note on `rendered_last_lines`.
+    #[allow(dead_code)]
     pub fn rendered_last_lines_formatted(&self, n: usize) -> Vec<u8> {
         if n == 0 {
             return Vec::new();
@@ -108,6 +123,76 @@ impl VirtualTerminal {
         out.extend_from_slice(b"\x1b[0m");
         out
     }
+}
+
+/// Replay raw PTY bytes through a freshly-sized vt100 parser and return the
+/// last `n` non-blank rendered rows with SGR (color/attribute) escape codes
+/// preserved.
+///
+/// The live `VirtualTerminal` is bound to the agent's PTY size (typically
+/// 80x24), so its rendered screen has at most 24 rows of content. Callers
+/// like `amux top`'s preview pane in a tall (e.g. 50-row) terminal need
+/// more than that. This helper builds a temporary `vt100::Parser` sized to
+/// the caller's preview height, feeds it the raw scrollback bytes, and
+/// extracts the most recent `n` non-blank rows from that taller render.
+///
+/// Behavior notes:
+/// - Alt-screen toggles in the byte stream are honored — a session that
+///   ended in alt-screen mode (e.g. claude REPL, vim) renders its alt
+///   screen, which is sized to the caller's `rows`. The agent itself only
+///   draws within its own PTY rows, so taller preview rows above/below
+///   stay blank and are filtered.
+/// - The first few rows of the replay may show partial state if the raw
+///   scrollback ring buffer's oldest bytes start mid-escape. Acceptable
+///   for a preview pane.
+pub fn render_raw_scrollback_formatted(
+    raw: &[u8],
+    rows: u16,
+    cols: u16,
+    n: usize,
+) -> Vec<u8> {
+    if n == 0 || raw.is_empty() {
+        return Vec::new();
+    }
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(raw);
+    let screen = parser.screen();
+
+    let mut row_texts: Vec<String> = Vec::with_capacity(rows as usize);
+    for r in 0..rows {
+        let mut text = String::new();
+        for c in 0..cols {
+            if let Some(cell) = screen.cell(r, c) {
+                if !cell.is_wide_continuation() {
+                    text.push_str(cell.contents());
+                }
+            }
+        }
+        row_texts.push(text);
+    }
+    let non_blank: Vec<u16> = row_texts
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.trim().is_empty())
+        .map(|(i, _)| i as u16)
+        .collect();
+    if non_blank.is_empty() {
+        return Vec::new();
+    }
+    let start = non_blank.len().saturating_sub(n);
+    let selected = &non_blank[start..];
+
+    let mut out = Vec::new();
+    for (i, &row_idx) in selected.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        write_row_sgr(&mut out, screen, row_idx, cols);
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    out
 }
 
 /// SGR-relevant attributes of a cell.
@@ -510,6 +595,100 @@ mod tests {
         let out = vt.rendered_last_lines_formatted(2);
         let plain = strip_escapes(&out);
         assert_eq!(plain, "d\ne");
+    }
+
+    // ---- render_raw_scrollback_formatted: replay raw scrollback into a tall parser ----
+
+    #[test]
+    fn raw_replay_more_than_screen_rows() {
+        // Bug bd-pmk: live vterm caps at the agent's PTY size (24 rows), so
+        // even when the caller asks for 40 lines they only get up to 24.
+        // The replay helper builds a fresh tall parser and feeds raw bytes,
+        // letting us recover scrolled-off history beyond the live screen.
+        let mut raw = Vec::new();
+        for i in 1..=80 {
+            raw.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        // Replay through a 50-row parser; ask for 40 non-blank lines.
+        let out = render_raw_scrollback_formatted(&raw, 50, 80, 40);
+        let plain = strip_escapes(&out);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert!(
+            lines.len() >= 35,
+            "expected >=35 replayed lines, got {} (lines={:?})",
+            lines.len(),
+            lines
+        );
+        // Tail should be the most recent lines.
+        assert_eq!(*lines.last().unwrap(), "line 80");
+    }
+
+    #[test]
+    fn raw_replay_empty_input() {
+        let out = render_raw_scrollback_formatted(&[], 50, 80, 40);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn raw_replay_zero_lines() {
+        let raw = b"hello\r\nworld\r\n";
+        let out = render_raw_scrollback_formatted(raw, 24, 80, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn raw_replay_short_input_within_screen() {
+        // Three lines into a 24-row parser; asking for 10 returns those 3.
+        let raw = b"a\r\nb\r\nc\r\n";
+        let out = render_raw_scrollback_formatted(raw, 24, 80, 10);
+        let plain = strip_escapes(&out);
+        assert_eq!(plain, "a\nb\nc");
+    }
+
+    #[test]
+    fn raw_replay_alt_screen_does_not_show_smashed_content() {
+        // Agent is in alt-screen mode (CSI ?1049h) drawing a 5-line TUI.
+        // Replay through a tall (50-row) parser must still respect alt-screen
+        // — output is the 5 visible lines, not crammed into more rows.
+        let mut raw = Vec::new();
+        // Pre-alt-screen scrollback with normal text.
+        raw.extend_from_slice(b"history line 1\r\nhistory line 2\r\n");
+        // Enter alt-screen.
+        raw.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+        // Five lines of TUI.
+        for i in 1..=5 {
+            raw.extend_from_slice(format!("TUI row {i}\r\n").as_bytes());
+        }
+        let out = render_raw_scrollback_formatted(&raw, 50, 80, 40);
+        let plain = strip_escapes(&out);
+        // Should be the alt-screen content; pre-alt-screen history must NOT
+        // appear (it lives in the main grid, which alt-screen hides).
+        assert!(!plain.contains("history line"), "got: {:?}", plain);
+        assert!(plain.contains("TUI row 1"), "got: {:?}", plain);
+        assert!(plain.contains("TUI row 5"), "got: {:?}", plain);
+    }
+
+    #[test]
+    fn raw_replay_strips_cursor_codes() {
+        let raw = b"\x1b[31mred line\x1b[0m\r\nplain\r\n";
+        let out = render_raw_scrollback_formatted(raw, 24, 80, 5);
+        let text = String::from_utf8_lossy(&out).to_string();
+        for bad in ["\x1b[H", "\x1b[1;1H", "\x1b[A", "\x1b[B", "\x1b[J", "\x1b[K"] {
+            assert!(!text.contains(bad), "found cursor code {:?} in: {:?}", bad, text);
+        }
+    }
+
+    #[test]
+    fn raw_replay_preserves_sgr() {
+        let raw = b"\x1b[31mred text\x1b[0m\r\n";
+        let out = render_raw_scrollback_formatted(raw, 24, 80, 5);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("red text"), "missing text: {:?}", text);
+        assert!(
+            text.contains("\x1b[") && (text.contains(";31") || text.contains("[31")),
+            "expected SGR red code in {:?}",
+            text
+        );
     }
 
     #[test]

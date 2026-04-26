@@ -362,16 +362,21 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // Clamp selection
         selected = clamp_selection(selected, sorted.len());
 
-        // Fetch scrollback for the selected session
+        // Get terminal size first so we know how much preview the layout has.
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let layout = compute_layout(sorted.len() as u16, rows);
+
+        // Ask the daemon for enough lines to fill the preview pane. The
+        // daemon replays raw scrollback through a tall vt100 parser to
+        // recover history past the agent's PTY size (bd-pmk). A small
+        // margin guards against trailing-blank filtering shrinking the
+        // result below the available rows.
+        let requested_lines = (layout.preview_row_count as usize).saturating_add(8).max(30);
         let preview_raw = if !sorted.is_empty() {
-            fetch_scrollback(&sorted[selected].name, 30).unwrap_or_default()
+            fetch_scrollback(&sorted[selected].name, requested_lines).unwrap_or_default()
         } else {
             Vec::new()
         };
-
-        // Get terminal size
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let layout = compute_layout(sorted.len() as u16, rows);
 
         let preview = render_preview(
             &preview_raw,
