@@ -132,6 +132,26 @@ impl Session {
         // Open a PTY pair.
         let pty = openpty(Some(&winsize), None)?;
         let slave_fd = pty.slave.as_raw_fd();
+        let master_fd = pty.master.as_raw_fd();
+
+        // Set FD_CLOEXEC on both PTY fds so they don't leak into later
+        // unrelated fork+exec children. Without this, when the daemon
+        // forks a *subsequent* session, the new child inherits every
+        // prior session's master fd; those inherited masters keep older
+        // slaves attached to a master that can't be fully closed, so
+        // older child processes never get SIGHUP and become orphaned.
+        // FD_CLOEXEC propagates through fork() and is honored at execve();
+        // the dup2(slave_fd, 0..=2) below produces NEW fds without the
+        // flag, so this child's stdio is unaffected.
+        // See docs/cat-leak-investigation.md.
+        for fd in [master_fd, slave_fd] {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
 
         // Use default cooked terminal settings on the PTY slave.
         // openpty() provides sane defaults (OPOST, ONLCR, ICRNL, ISIG,
@@ -668,6 +688,86 @@ mod tests {
             text.contains("43 132"),
             "expected '43 132' in stty output, got: {:?}",
             text
+        );
+    }
+
+    /// Regression test for the orphan-cat / PTY master leak (bd-f2j).
+    /// Without FD_CLOEXEC on the master fd, each subsequent Session::spawn
+    /// fork would leak prior sessions' master fds into the new child.
+    /// We assert that every spawned child holds *zero* `/dev/ptmx` fds —
+    /// only its slave PTY for stdin/stdout/stderr.
+    /// See docs/cat-leak-investigation.md.
+    #[tokio::test]
+    async fn test_no_pty_master_leak_across_spawns() {
+        // Skip if lsof is unavailable.
+        if std::process::Command::new("lsof")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            eprintln!("lsof not available, skipping leak regression test");
+            return;
+        }
+
+        let n = 4;
+        let mut sessions = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = Session::spawn(
+                format!("ptmx-leak-{}", i),
+                &["cat".to_string()],
+                80,
+                24,
+                None,
+                None,
+            )
+            .expect("spawn failed");
+            sessions.push(s);
+        }
+
+        // Give each child a moment to fully exec and settle.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Each child should have NO /dev/ptmx entries — its stdio is
+        // attached to its slave PTY (/dev/ttysNN on macOS, /dev/pts/N
+        // on Linux), and FD_CLOEXEC must have closed any inherited
+        // master fds at exec().
+        let mut leaks = Vec::new();
+        for s in &sessions {
+            let pid = s.child_pid.as_raw();
+            let out = std::process::Command::new("lsof")
+                .args(["-p", &pid.to_string()])
+                .output()
+                .expect("lsof failed");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let ptmx_lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("/dev/ptmx"))
+                .collect();
+            if !ptmx_lines.is_empty() {
+                leaks.push(format!(
+                    "child {} (session {}) has {} inherited master fd(s):\n{}",
+                    pid,
+                    s.name,
+                    ptmx_lines.len(),
+                    ptmx_lines.join("\n")
+                ));
+            }
+        }
+
+        // Cleanup: kill every session before failing so we don't add
+        // to the orphan pile if the assertion fires.
+        for s in &mut sessions {
+            if let Some(tx) = s.kill_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        // Best-effort: wait briefly for io_loops to deliver SIGTERM.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            leaks.is_empty(),
+            "PTY master fds leaked into spawned children:\n{}",
+            leaks.join("\n\n")
         );
     }
 
