@@ -64,19 +64,80 @@ pub fn runtime_dir_for(instance: Option<&str>) -> PathBuf {
     }
 }
 
-/// Derive an instance name from the current working directory's
-/// project root (the directory containing `.git`). Returns `None` when
-/// the cwd is not inside any git project.
+/// Derive an instance name from the current working directory.
 ///
-/// The derived name is stable across processes (uses a fixed-seed hash
-/// of the canonical project root path), so every `amux` invocation
-/// from inside the same project — including from sibling git
-/// worktrees — resolves to the same name and therefore the same
-/// daemon.
+/// Two branches:
+///
+/// 1. **cwd is inside a git project** — use the project root's
+///    basename (with a hash suffix). Sibling git worktrees of one
+///    project resolve to the same name and therefore the same daemon.
+/// 2. **cwd is NOT inside any git project** — fall back to the cwd's
+///    own basename (slugified) plus a hash of the canonical cwd. So
+///    every directory still gets a stable instance label, and
+///    `amux top` can show e.g. `[instance: tmp-1a2b]` from `/tmp`
+///    instead of an empty label.
+///
+/// Returns `None` only when the cwd is unreadable or the basename is
+/// empty after slugification (i.e. cwd is the filesystem root). In
+/// that case callers fall back to the legacy un-suffixed runtime path.
+///
+/// The derived name is byte-stable across processes (fixed-seed hash
+/// of the canonical path), so two invocations from the same directory
+/// always resolve to the same name.
 pub fn derive_instance_from_cwd() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let project_root = find_project_root(&cwd)?;
-    Some(instance_name_for_root(&project_root))
+    derive_instance_from_path(&cwd)
+}
+
+/// Pure helper: same logic as [`derive_instance_from_cwd`] but takes
+/// the cwd explicitly so it can be unit-tested without mutating the
+/// process cwd (which is racy under parallel `cargo test`).
+fn derive_instance_from_path(cwd: &Path) -> Option<String> {
+    if let Some(project_root) = find_project_root(cwd) {
+        return Some(instance_name_for_root(&project_root));
+    }
+    derive_instance_from_pwd(cwd)
+}
+
+/// Build an instance name from a non-git cwd's own basename. Format
+/// `{slug}-{4 hex chars}` — same shape as `instance_name_for_root` so
+/// the two branches are visually indistinguishable in `amux top` and
+/// runtime path names. Returns `None` when slugification yields an
+/// empty string (cwd is `/` or has no usable basename).
+fn derive_instance_from_pwd(cwd: &Path) -> Option<String> {
+    let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let basename = canon.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let slug = pwd_slug(basename);
+    if slug.is_empty() {
+        return None;
+    }
+    let hash = fnv1a_64(canon.to_string_lossy().as_bytes());
+    Some(format!("{}-{:04x}", slug, (hash & 0xffff) as u16))
+}
+
+/// Slug a path basename for the PWD branch: lowercase, replace any run
+/// of non-alphanumeric chars with a single `-`, trim leading/trailing
+/// dashes. Stricter than [`sanitize_basename`] (which preserves case,
+/// `_`, and runs of `-`) because the PWD branch generates names from
+/// arbitrary user directories — spaces, dots, mixed case, mktemp
+/// suffixes — and we want a single canonical form.
+fn pwd_slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for c in s.chars() {
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_alphanumeric() {
+            out.push(lc);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 /// Walk up from `start` to find the project root — the directory
@@ -549,6 +610,119 @@ mod tests {
         std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/rel\n").unwrap();
         let root = find_project_root(&wt).expect("must resolve relative gitfile");
         assert_eq!(canonicalize_or(&root), canonicalize_or(&main));
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn pwd_slug_lowercases_and_keeps_alnum() {
+        assert_eq!(pwd_slug("MyDir2"), "mydir2");
+        assert_eq!(pwd_slug("abc123"), "abc123");
+    }
+
+    #[test]
+    fn pwd_slug_replaces_runs_of_unsafe_chars_with_single_dash() {
+        // Runs of mixed unsafe chars collapse to one dash — the strict
+        // slug treats `_`, `.`, `-`, space, etc. all as separators.
+        assert_eq!(pwd_slug("foo bar"), "foo-bar");
+        assert_eq!(pwd_slug("foo___bar"), "foo-bar");
+        assert_eq!(pwd_slug("foo...bar"), "foo-bar");
+        assert_eq!(pwd_slug("foo - bar"), "foo-bar");
+        assert_eq!(pwd_slug("tmp.XXXXX"), "tmp-xxxxx");
+    }
+
+    #[test]
+    fn pwd_slug_trims_leading_and_trailing_dashes() {
+        assert_eq!(pwd_slug("...foo..."), "foo");
+        assert_eq!(pwd_slug("---foo---"), "foo");
+        assert_eq!(pwd_slug("  hello  "), "hello");
+    }
+
+    #[test]
+    fn pwd_slug_returns_empty_for_no_alnum_input() {
+        assert_eq!(pwd_slug(""), "");
+        assert_eq!(pwd_slug("..."), "");
+        assert_eq!(pwd_slug("/"), "");
+        assert_eq!(pwd_slug("---"), "");
+    }
+
+    #[test]
+    fn derive_instance_from_pwd_returns_basename_with_hash_suffix() {
+        // Shape check — slug + "-" + 4 hex chars, slug derives from the
+        // canonical basename.
+        let tmp = tempdir_unique("amux-pwd-shape");
+        let result = derive_instance_from_pwd(&tmp).expect("non-empty basename");
+        let (slug, hex) = result.rsplit_once('-').expect("must contain a '-'");
+        // tempdir_unique includes pid + nanos, all digits — so the
+        // slug starts with our prefix.
+        assert!(slug.starts_with("amux-pwd-shape"));
+        assert_eq!(hex.len(), 4);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn derive_instance_from_pwd_is_stable_for_same_path() {
+        // Two calls on the same dir yield the same name — required so
+        // every amux invocation from the same cwd hits the same daemon.
+        let tmp = tempdir_unique("amux-pwd-stable");
+        let a = derive_instance_from_pwd(&tmp).expect("must derive");
+        let b = derive_instance_from_pwd(&tmp).expect("must derive");
+        assert_eq!(a, b);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn derive_instance_from_pwd_returns_none_for_root() {
+        // basename of "/" is None → slug is empty → None, so the
+        // legacy un-suffixed runtime path kicks in.
+        assert_eq!(derive_instance_from_pwd(Path::new("/")), None);
+    }
+
+    #[test]
+    fn derive_instance_from_pwd_disambiguates_same_basename_in_different_parents() {
+        // Two non-git dirs both named "foo" but in different parents
+        // must get different hashes — same guarantee as the git branch.
+        let tmp_a = tempdir_unique("amux-pwd-disA");
+        let tmp_b = tempdir_unique("amux-pwd-disB");
+        let dir_a = tmp_a.join("foo");
+        let dir_b = tmp_b.join("foo");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let a = derive_instance_from_pwd(&dir_a).unwrap();
+        let b = derive_instance_from_pwd(&dir_b).unwrap();
+        // Both start with "foo-" but the hash differs.
+        assert!(a.starts_with("foo-"), "a={a}");
+        assert!(b.starts_with("foo-"), "b={b}");
+        assert_ne!(a, b);
+        cleanup(&tmp_a);
+        cleanup(&tmp_b);
+    }
+
+    #[test]
+    fn derive_instance_from_path_uses_pwd_when_no_git_repo() {
+        // No .git anywhere on the way to /, so we fall through to the
+        // PWD branch — the whole point of this bead.
+        let tmp = tempdir_unique("amux-fallback");
+        let result = derive_instance_from_path(&tmp).expect("must derive from PWD");
+        assert!(
+            result.starts_with("amux-fallback"),
+            "expected slug to start with 'amux-fallback', got {result}"
+        );
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn derive_instance_from_path_uses_git_branch_when_inside_repo() {
+        // If a .git dir exists, the git branch wins — PWD fallback is
+        // strictly the no-git path.
+        let tmp = tempdir_unique("amux-git-wins");
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        let inside = tmp.join("sub/dir");
+        std::fs::create_dir_all(&inside).unwrap();
+        let from_inside = derive_instance_from_path(&inside).expect("must derive");
+        let from_root = derive_instance_from_path(&tmp).expect("must derive");
+        // Both resolve to the project root, not the cwd basename "dir".
+        assert_eq!(from_inside, from_root);
         cleanup(&tmp);
     }
 
