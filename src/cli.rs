@@ -211,6 +211,50 @@ pub enum Command {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Print the current session name (the value of `$AMUX_SESSION`).
+    /// Exits 0 when set; exits 1 with a stderr message when unset.
+    /// Pure-stdlib helper — no daemon roundtrip. Used by slash-commands
+    /// and shell snippets to discover whether they're inside an amux
+    /// session and, if so, which one.
+    Current,
+    /// Stage a handoff message and atomically cycle the session's
+    /// child process. Higher-level wrapper around `respawn` (bd-wh4):
+    ///   1. Resolves the target session (`-n <name>` or `$AMUX_SESSION`).
+    ///   2. If `--message` is given, atomically writes it to
+    ///      `<runtime_dir>/handoff/<name>.msg` (consumed by the next
+    ///      session on startup).
+    ///   3. Builds the restart command — positional `-- <cmd...>` if
+    ///      given, else defaults to `claude`. With the `claude`
+    ///      default, `--prime <prompt>` is forwarded as claude's first
+    ///      message arg.
+    ///   4. Calls into the daemon's `RespawnSession` machinery.
+    Handoff {
+        /// Target session name. Defaults to `$AMUX_SESSION` if unset.
+        #[arg(short = 'n', long = "name", visible_alias = "target", short_alias = 't')]
+        name: Option<String>,
+        /// Handoff message to stage at `<runtime_dir>/handoff/<name>.msg`
+        /// (atomic write). The next session reads and clears this file
+        /// on startup.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// First-message prompt for claude. Only honored when the
+        /// restart command defaults to `claude`; ignored when the
+        /// caller supplies an explicit positional `-- <cmd...>`.
+        #[arg(long = "prime")]
+        prime: Option<String>,
+        /// Working directory for the new child (defaults to the
+        /// session's original cwd).
+        #[arg(short = 'c', long = "cwd")]
+        cwd: Option<String>,
+        /// Set environment variable (KEY=VALUE), can be specified
+        /// multiple times. Always merged with `AMUX_SESSION=<name>`.
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Command to run on respawn. When omitted, defaults to
+        /// `claude` (or `claude <prime>` if `--prime` is set).
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
     /// Ping the server (health check)
     Ping,
 }
@@ -486,6 +530,87 @@ mod tests {
     fn test_respawn_requires_command() {
         let result = super::Cli::try_parse_from(["amux", "respawn", "-n", "x"]);
         assert!(result.is_err(), "respawn must require a command");
+    }
+
+    #[test]
+    fn test_current_parses() {
+        let cli = super::Cli::try_parse_from(["amux", "current"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::Current => {}
+            other => panic!("expected Current, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handoff_no_args() {
+        // Bare `amux handoff` — name resolves at runtime from $AMUX_SESSION.
+        let cli = super::Cli::try_parse_from(["amux", "handoff"]).unwrap();
+        match cli.command.unwrap() {
+            super::Command::Handoff {
+                name,
+                message,
+                prime,
+                cwd,
+                env,
+                cmd,
+            } => {
+                assert!(name.is_none());
+                assert!(message.is_none());
+                assert!(prime.is_none());
+                assert!(cwd.is_none());
+                assert!(env.is_empty());
+                assert!(cmd.is_empty());
+            }
+            other => panic!("expected Handoff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handoff_full_form() {
+        let cli = super::Cli::try_parse_from([
+            "amux",
+            "handoff",
+            "-n",
+            "orch",
+            "--message",
+            "carry on",
+            "--prime",
+            "/conductor",
+            "--",
+            "bash",
+            "-i",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::Handoff {
+                name,
+                message,
+                prime,
+                cmd,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("orch"));
+                assert_eq!(message.as_deref(), Some("carry on"));
+                assert_eq!(prime.as_deref(), Some("/conductor"));
+                assert_eq!(cmd, vec!["bash", "-i"]);
+            }
+            other => panic!("expected Handoff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handoff_target_alias() {
+        let cli = super::Cli::try_parse_from([
+            "amux", "handoff", "-t", "agent", "-m", "hi",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::Handoff { name, message, .. } => {
+                assert_eq!(name.as_deref(), Some("agent"));
+                assert_eq!(message.as_deref(), Some("hi"));
+            }
+            other => panic!("expected Handoff, got {:?}", other),
+        }
     }
 
     #[test]

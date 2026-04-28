@@ -1,4 +1,6 @@
 mod attach;
+mod current;
+mod handoff;
 mod query;
 mod respawn;
 mod server;
@@ -104,6 +106,20 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Respawn { name, cwd, env, cmd } => {
             ensure_daemon_running()?;
             respawn::do_respawn(&name, cwd, env, cmd)?;
+        }
+        Command::Current => {
+            current::do_current()?;
+        }
+        Command::Handoff {
+            name,
+            message,
+            prime,
+            cwd,
+            env,
+            cmd,
+        } => {
+            ensure_daemon_running()?;
+            handoff::do_handoff(name, message, prime, cwd, env, cmd)?;
         }
         Command::Env { action } => {
             ensure_daemon_running()?;

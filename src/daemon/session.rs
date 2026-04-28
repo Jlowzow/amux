@@ -220,6 +220,11 @@ impl Session {
                 if let Some(ref env_vars) = env {
                     command.envs(env_vars);
                 }
+                // Always export AMUX_SESSION=<name> so the new child can
+                // discover its own session name (parity with the respawn
+                // path; consumed by `amux current`, /handoff, etc.). Set
+                // last so it overrides any caller-supplied AMUX_SESSION.
+                command.env("AMUX_SESSION", &name);
                 if let Some(ref dir) = cwd {
                     command.current_dir(dir);
                 }
@@ -1388,6 +1393,84 @@ mod tests {
             after.windows(5).any(|w| w == b"AFTER"),
             "pre-respawn output subscriber must keep receiving (saw {:?})",
             String::from_utf8_lossy(&after)
+        );
+
+        let _ = nix::sys::signal::kill(session.child_pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// bd-uhp: AMUX_SESSION is always exported into the original spawn
+    /// path too (not only respawn). Lets `amux current` and consumers in
+    /// the freshly-spawned child discover their session name without a
+    /// daemon roundtrip.
+    #[tokio::test]
+    async fn test_spawn_sets_amux_session_env() {
+        let session = Session::spawn(
+            "spawn-amuxenv".to_string(),
+            &[
+                "bash".to_string(),
+                "-c".to_string(),
+                "echo AMUX_SESSION_IS=$AMUX_SESSION; sleep 30".to_string(),
+            ],
+            80,
+            24,
+            None,
+            None,
+        )
+        .expect("spawn failed");
+
+        let mut rx = session.output_tx.subscribe();
+        let out = drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(3),
+            |buf| {
+                let s = String::from_utf8_lossy(buf);
+                s.contains("AMUX_SESSION_IS=spawn-amuxenv")
+            },
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&out).contains("AMUX_SESSION_IS=spawn-amuxenv"),
+            "expected AMUX_SESSION=spawn-amuxenv in spawn child output, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let _ = nix::sys::signal::kill(session.child_pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// bd-uhp: caller-supplied AMUX_SESSION must NOT win over the
+    /// session-derived name — otherwise a worker that exports a stale
+    /// AMUX_SESSION before invoking `amux new` would mislead the child.
+    /// We always set AMUX_SESSION last in the env chain.
+    #[tokio::test]
+    async fn test_spawn_amux_session_overrides_caller_env() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("AMUX_SESSION".to_string(), "stale-name".to_string());
+        let session = Session::spawn(
+            "real-name".to_string(),
+            &[
+                "bash".to_string(),
+                "-c".to_string(),
+                "echo AMUX_SESSION_IS=$AMUX_SESSION; sleep 30".to_string(),
+            ],
+            80,
+            24,
+            Some(env),
+            None,
+        )
+        .expect("spawn failed");
+
+        let mut rx = session.output_tx.subscribe();
+        let out = drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(3),
+            |buf| String::from_utf8_lossy(buf).contains("AMUX_SESSION_IS="),
+        )
+        .await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("AMUX_SESSION_IS=real-name"),
+            "expected AMUX_SESSION=real-name (not stale-name), got: {:?}",
+            s
         );
 
         let _ = nix::sys::signal::kill(session.child_pid, nix::sys::signal::Signal::SIGKILL);
