@@ -208,6 +208,48 @@ enum TopAction {
     Quit,
     Attach(String),
     Follow(String),
+    /// User pressed 'i' — drop into single-line input mode targeting the
+    /// currently highlighted session (design A from bd-ly6).
+    EnterInput,
+}
+
+/// Result of handling a key while top is in input mode.
+#[derive(Debug, PartialEq, Eq)]
+enum InputResult {
+    /// Stay in input mode; the buffer may have been mutated.
+    Continue,
+    /// Exit input mode without sending anything (Esc / Ctrl-C).
+    Cancel,
+    /// Exit input mode and send the buffer (followed by Enter) to the
+    /// highlighted session. The buffer is taken out of the caller's slot.
+    Submit(String),
+}
+
+/// Mutate `buffer` in place and return what the caller should do next.
+///
+/// Backspace pops the last char (not byte — UTF-8 safe via `String::pop`).
+/// Plain `Char(c)` appends. Enter submits, Esc / Ctrl-C cancels. Anything
+/// else is ignored so e.g. arrow keys don't accidentally inject control
+/// codes into the agent.
+fn handle_input_key(
+    buffer: &mut String,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> InputResult {
+    match code {
+        KeyCode::Esc => InputResult::Cancel,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => InputResult::Cancel,
+        KeyCode::Enter => InputResult::Submit(std::mem::take(buffer)),
+        KeyCode::Backspace => {
+            buffer.pop();
+            InputResult::Continue
+        }
+        KeyCode::Char(c) => {
+            buffer.push(c);
+            InputResult::Continue
+        }
+        _ => InputResult::Continue,
+    }
 }
 
 /// Absolute row positions for each section of the top TUI.
@@ -337,6 +379,12 @@ pub fn do_top() -> anyhow::Result<()> {
 fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
     let mut trackers: HashMap<String, ActivityTracker> = HashMap::new();
     let mut selected: usize = 0;
+    // None = normal mode; Some(buf) = input mode collecting `buf` to send
+    // to the highlighted session on Enter (design A from bd-ly6).
+    let mut input_mode: Option<String> = None;
+    // One-shot status text shown on the bottom row right after a send,
+    // so the user gets confirmation without leaving normal mode.
+    let mut input_flash: Option<String> = None;
 
     loop {
         // Poll sessions from daemon
@@ -508,15 +556,43 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
             }
         }
 
-        // Status bar (summary + help combined on one line)
-        let summary = summary_line(&sorted);
-        execute!(
-            stdout,
-            cursor::MoveTo(0, layout.summary_row),
-            SetForegroundColor(Color::DarkGrey)
-        )?;
-        write!(stdout, "{}  │  j/k:select  Enter:attach  f:follow  q:quit", summary)?;
-        execute!(stdout, ResetColor)?;
+        // Status bar — three modes:
+        //   1. input mode: replace the bar with a `> ` prompt and the buffer
+        //   2. flash:      show a one-tick "sent to <name>" confirmation
+        //   3. normal:     summary + key hints
+        execute!(stdout, cursor::MoveTo(0, layout.summary_row))?;
+        if let Some(buf) = input_mode.as_ref() {
+            let target = sorted.get(selected).map(|s| s.name.as_str()).unwrap_or("(none)");
+            execute!(
+                stdout,
+                SetForegroundColor(Color::Yellow),
+                SetAttribute(Attribute::Bold)
+            )?;
+            write!(stdout, "send → {}: {}", target, buf)?;
+            execute!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
+        } else if let Some(msg) = input_flash.take() {
+            execute!(stdout, SetForegroundColor(Color::Green))?;
+            write!(stdout, "{}", msg)?;
+            execute!(stdout, ResetColor)?;
+        } else {
+            let summary = summary_line(&sorted);
+            execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+            write!(
+                stdout,
+                "{}  │  j/k:select  Enter:attach  f:follow  i:input  q:quit",
+                summary
+            )?;
+            execute!(stdout, ResetColor)?;
+        }
+
+        // Show the cursor at the end of the buffer when we're collecting
+        // input — a blinking caret makes typing feel responsive without
+        // needing extra glyphs in the prompt itself.
+        if input_mode.is_some() {
+            execute!(stdout, cursor::Show)?;
+        } else {
+            execute!(stdout, cursor::Hide)?;
+        }
 
         stdout.flush()?;
 
@@ -524,26 +600,60 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         // responsive and the session/activity data refreshes at ~10Hz.
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
-                let action = handle_key(code, modifiers, &sorted, &mut selected);
-                match action {
-                    TopAction::Quit => break,
-                    TopAction::Attach(name) => {
-                        // Restore terminal, attach, then re-enter alternate screen
-                        terminal::disable_raw_mode()?;
-                        execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
-                        // Use the attach command
-                        let _ = super::attach::do_attach(&name);
-                        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-                        terminal::enable_raw_mode()?;
+                if let Some(buffer) = input_mode.as_mut() {
+                    // Input mode: keys go into the buffer, not the table
+                    // navigation. The selected row is frozen here so the
+                    // target the user saw when they pressed 'i' is the
+                    // target Enter sends to.
+                    match handle_input_key(buffer, code, modifiers) {
+                        InputResult::Continue => {}
+                        InputResult::Cancel => {
+                            input_mode = None;
+                        }
+                        InputResult::Submit(text) => {
+                            input_mode = None;
+                            if let Some(target) = sorted.get(selected) {
+                                let target_name = target.name.clone();
+                                input_flash = match send_to_session(&target_name, &text) {
+                                    Ok(()) => Some(format!(
+                                        "sent {} bytes + Enter to {}",
+                                        text.len(),
+                                        target_name
+                                    )),
+                                    Err(e) => Some(format!(
+                                        "send to {} failed: {}",
+                                        target_name, e
+                                    )),
+                                };
+                            }
+                        }
                     }
-                    TopAction::Follow(name) => {
-                        terminal::disable_raw_mode()?;
-                        execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
-                        let _ = super::attach::do_follow(&name, false);
-                        execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-                        terminal::enable_raw_mode()?;
+                } else {
+                    let action = handle_key(code, modifiers, &sorted, &mut selected);
+                    match action {
+                        TopAction::Quit => break,
+                        TopAction::Attach(name) => {
+                            // Restore terminal, attach, then re-enter alternate screen
+                            terminal::disable_raw_mode()?;
+                            execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+                            // Use the attach command
+                            let _ = super::attach::do_attach(&name);
+                            execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+                            terminal::enable_raw_mode()?;
+                        }
+                        TopAction::Follow(name) => {
+                            terminal::disable_raw_mode()?;
+                            execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+                            let _ = super::attach::do_follow(&name, false);
+                            execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+                            terminal::enable_raw_mode()?;
+                        }
+                        TopAction::EnterInput => {
+                            input_mode = Some(String::new());
+                            input_flash = None;
+                        }
+                        TopAction::Continue => {}
                     }
-                    TopAction::Continue => {}
                 }
             }
         }
@@ -586,7 +696,36 @@ fn handle_key(
                 TopAction::Continue
             }
         }
+        KeyCode::Char('i') => {
+            // Drop into input mode only when there's a session to send to —
+            // pressing 'i' on an empty list would leave the user in an
+            // unsendable state.
+            if !sessions.is_empty() {
+                TopAction::EnterInput
+            } else {
+                TopAction::Continue
+            }
+        }
         _ => TopAction::Continue,
+    }
+}
+
+/// Push `text` (followed by a carriage return) to the named session via
+/// SendInput. Mirrors `amux send` semantics — `\r` is what the TTY line
+/// discipline turns into a real newline. Errors are returned to the
+/// caller, which logs and stays in top.
+fn send_to_session(name: &str, text: &str) -> anyhow::Result<()> {
+    let mut data = text.as_bytes().to_vec();
+    data.push(b'\r');
+    let resp = client::request(&ClientMessage::SendInput {
+        name: name.to_string(),
+        data,
+        newline: false,
+    })?;
+    match resp {
+        DaemonMessage::InputSent => Ok(()),
+        DaemonMessage::Error(e) => anyhow::bail!(e),
+        _ => anyhow::bail!("unexpected response"),
     }
 }
 
@@ -1112,6 +1251,105 @@ mod tests {
             handle_key(KeyCode::Char('f'), KeyModifiers::NONE, &sessions, &mut sel),
             TopAction::Continue
         ));
+    }
+
+    // --- Input mode (design A from bd-ly6) ---
+
+    #[test]
+    fn test_handle_key_i_enters_input_mode() {
+        // 'i' on a list with a highlighted row asks the loop to drop
+        // into input mode targeting whatever's selected. The test is
+        // unit-level: we only verify the action variant — the loop owns
+        // the buffer state.
+        let sessions = vec![make_session("worker-1", true, 10, 1, None)];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Char('i'), KeyModifiers::NONE, &sessions, &mut sel),
+            TopAction::EnterInput
+        ));
+    }
+
+    #[test]
+    fn test_handle_key_i_empty_sessions() {
+        // No session = nowhere to send to. 'i' must be a no-op so the
+        // user can't get stuck in an unsendable input mode.
+        let sessions: Vec<SessionInfo> = vec![];
+        let mut sel = 0;
+        assert!(matches!(
+            handle_key(KeyCode::Char('i'), KeyModifiers::NONE, &sessions, &mut sel),
+            TopAction::Continue
+        ));
+    }
+
+    #[test]
+    fn test_input_key_chars_append_to_buffer() {
+        let mut buf = String::new();
+        let r = handle_input_key(&mut buf, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Continue);
+        let _ = handle_input_key(&mut buf, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(buf, "hi");
+    }
+
+    #[test]
+    fn test_input_key_backspace_pops_last_char() {
+        let mut buf = String::from("foo");
+        let r = handle_input_key(&mut buf, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Continue);
+        assert_eq!(buf, "fo");
+    }
+
+    #[test]
+    fn test_input_key_backspace_on_empty_is_safe() {
+        // Pop on empty must not panic (String::pop returns None).
+        let mut buf = String::new();
+        let r = handle_input_key(&mut buf, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Continue);
+        assert_eq!(buf, "");
+    }
+
+    #[test]
+    fn test_input_key_enter_submits_and_clears() {
+        let mut buf = String::from("list");
+        let r = handle_input_key(&mut buf, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Submit("list".to_string()));
+        assert_eq!(buf, "", "Submit should drain the buffer");
+    }
+
+    #[test]
+    fn test_input_key_esc_cancels_without_clearing_buffer() {
+        // Cancel just exits input mode; the loop drops the buffer.
+        // The handler doesn't need to clear it.
+        let mut buf = String::from("oops");
+        let r = handle_input_key(&mut buf, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Cancel);
+    }
+
+    #[test]
+    fn test_input_key_ctrl_c_cancels() {
+        let mut buf = String::from("typed");
+        let r = handle_input_key(&mut buf, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(r, InputResult::Cancel);
+    }
+
+    #[test]
+    fn test_input_key_ignores_arrow_keys() {
+        // Arrow keys would otherwise drop garbage like ↑ into the buffer
+        // if the handler accepted any KeyCode — guard against that.
+        let mut buf = String::from("abc");
+        let r = handle_input_key(&mut buf, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(r, InputResult::Continue);
+        assert_eq!(buf, "abc");
+    }
+
+    #[test]
+    fn test_input_key_unicode_appends() {
+        // Buffer is a String, not Vec<u8> — multi-byte chars should be a
+        // single push, and Backspace should pop the whole codepoint.
+        let mut buf = String::new();
+        let _ = handle_input_key(&mut buf, KeyCode::Char('é'), KeyModifiers::NONE);
+        assert_eq!(buf, "é");
+        let _ = handle_input_key(&mut buf, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(buf, "");
     }
 
     #[test]

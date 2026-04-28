@@ -157,13 +157,43 @@ pub fn do_kill_all() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `amux send` should push to the session, based on its argument list
+/// and what (if anything) is on stdin. Factored out so the stdin branch
+/// (design D from bd-ly6) is unit-testable without a real stdin handle.
+///
+/// Returns `(bytes, append_enter)`:
+/// - text args present → joined args, append `\r` unless `--literal`.
+/// - text args empty → read stdin verbatim, never append `\r` (the piped
+///   bytes are authoritative; they carry their own terminator if any).
+fn build_send_payload<R: std::io::Read>(
+    literal: bool,
+    text: &[String],
+    stdin: &mut R,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    if text.is_empty() {
+        let mut buf = Vec::new();
+        stdin.read_to_end(&mut buf)?;
+        Ok((buf, false))
+    } else {
+        let joined = text.join(" ");
+        Ok((joined.into_bytes(), !literal))
+    }
+}
+
 pub fn send_keys(name: &str, literal: bool, text: &[String]) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
     ensure_daemon_running()?;
-    let joined = text.join(" ");
-    let needs_enter = !literal;
+    if text.is_empty() && std::io::stdin().is_terminal() {
+        // No args + interactive stdin would block read_to_end on the user's
+        // keyboard waiting for Ctrl-D. Refuse instead of hanging silently.
+        anyhow::bail!(
+            "amux send: no text given and stdin is a terminal — pipe input or pass text args"
+        );
+    }
+    let (data, needs_enter) = build_send_payload(literal, text, &mut std::io::stdin().lock())?;
     let resp = client::request(&ClientMessage::SendInput {
         name: name.to_string(),
-        data: joined.into_bytes(),
+        data,
         newline: false,
     })?;
     match resp {
@@ -246,6 +276,74 @@ mod tests {
     use crate::protocol::codec::{try_read_frame_async, write_frame_async};
     use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
     use crate::util::strip_ansi;
+
+    /// Args path: text gets joined and `--literal` controls whether we
+    /// also append a `\r` afterwards (the daemon hop is unchanged).
+    #[test]
+    fn test_build_send_payload_args_default_appends_enter() {
+        let mut empty: &[u8] = b"";
+        let (data, needs_enter) =
+            super::build_send_payload(false, &["hello".to_string()], &mut empty).unwrap();
+        assert_eq!(data, b"hello");
+        assert!(needs_enter, "non-literal args should request a trailing \\r");
+    }
+
+    #[test]
+    fn test_build_send_payload_args_literal_skips_enter() {
+        let mut empty: &[u8] = b"";
+        let (data, needs_enter) =
+            super::build_send_payload(true, &["hello".to_string()], &mut empty).unwrap();
+        assert_eq!(data, b"hello");
+        assert!(!needs_enter, "--literal must not append \\r");
+    }
+
+    #[test]
+    fn test_build_send_payload_args_joined_with_spaces() {
+        let mut empty: &[u8] = b"";
+        let (data, _) = super::build_send_payload(
+            false,
+            &["foo".to_string(), "bar".to_string(), "baz".to_string()],
+            &mut empty,
+        )
+        .unwrap();
+        assert_eq!(data, b"foo bar baz");
+    }
+
+    /// Stdin path (design D): with no text args, read stdin verbatim and
+    /// don't append `\r` — piped bytes are authoritative (echo already
+    /// added `\n`; if the user wanted no terminator they used `echo -n`).
+    #[test]
+    fn test_build_send_payload_stdin_no_args() {
+        let mut piped: &[u8] = b"hi\n";
+        let (data, needs_enter) =
+            super::build_send_payload(false, &[], &mut piped).unwrap();
+        assert_eq!(data, b"hi\n");
+        assert!(!needs_enter, "stdin path must never inject its own \\r");
+    }
+
+    #[test]
+    fn test_build_send_payload_stdin_preserves_bytes_verbatim() {
+        // Multi-line stdin should pass through untouched, including
+        // embedded special chars — the agent's PTY decides what to do
+        // with them.
+        let mut piped: &[u8] = b"line1\nline2\n\x1b[31mred\x1b[0m";
+        let (data, needs_enter) =
+            super::build_send_payload(true, &[], &mut piped).unwrap();
+        assert_eq!(data, b"line1\nline2\n\x1b[31mred\x1b[0m");
+        assert!(!needs_enter);
+    }
+
+    #[test]
+    fn test_build_send_payload_stdin_empty_input() {
+        // `echo -n '' | amux send` — empty stdin, no args. Sends nothing
+        // and doesn't ask for a trailing Enter. Doesn't error.
+        let mut piped: &[u8] = b"";
+        let (data, needs_enter) =
+            super::build_send_payload(false, &[], &mut piped).unwrap();
+        assert!(data.is_empty());
+        assert!(!needs_enter);
+    }
+
 
     /// Integration test: verify SendInput path works.
     #[tokio::test]

@@ -87,6 +87,13 @@ The agent's PTY size tracks whoever is actively viewing the session:
 - **`amux top` defers to active attachers.** When `attach_count > 0` top reads the session's current size from `SessionInfo` and renders against that — the attacher controls the canvas.
 - The protocol message used by top is `ClientMessage::ResizeSession { name, cols, rows }`; it's a stateless one-shot resize distinct from `AttachResize` (which only makes sense inside an active attach connection).
 
+## Sending input from top (bd-ly6)
+
+`amux top` exposes two ways to push keystrokes into the highlighted agent without leaving the dashboard:
+
+- **`i` opens a single-line input box** at the bottom of the screen targeting the currently highlighted session. Type, then Enter to send `<text>\r` (same byte sequence `amux send` produces). Esc / Ctrl-C cancels without sending. The input box overlays the summary/help row; the table and preview keep refreshing in the background. The selected row is frozen for the duration of input mode so the target the user saw when they pressed `i` is the target Enter sends to. Empty buffer + Enter sends just `\r` — the "nudge with Enter" shortcut.
+- **`amux send` reads stdin when no text args are passed.** `echo hi | amux send -t Worker` forwards `hi\n` verbatim — no `\r` is appended (piped bytes are authoritative; if you wanted no terminator use `echo -n`). With text args the old behavior is unchanged: args are joined with spaces and a trailing `\r` is appended unless `--literal`. As a safety guard, `amux send -t Worker` with no args **and** an interactive stdin errors out instead of blocking on `read_to_end` waiting for Ctrl-D.
+
 ## Multi-agent orchestration (conductor)
 
 This repo dispatches beads to parallel worker agents using **conductor** (`~/Code/conductor`), which sits on top of amux + a file-based mailbox at `/tmp/conductor-mail/`.
