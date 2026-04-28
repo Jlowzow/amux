@@ -589,6 +589,15 @@ fn fetch_scrollback(name: &str, lines: usize) -> anyhow::Result<Vec<u8>> {
     // Formatted mode: rendered screen with SGR color codes preserved, cursor
     // positioning stripped. This lets the preview show the target's colors
     // (e.g. claude's UI) rather than monochrome text.
+    //
+    // We deliberately do NOT send a resize message to the previewed
+    // session here (bd-is4). Resizing on every preview refresh would
+    // cause the agent process to repaint at the new size every tick,
+    // producing visible flicker inside any attached window and pointless
+    // SIGWINCH churn. Instead the daemon replays raw scrollback through
+    // a temporary tall vt100 parser (bd-pmk) for streaming-output apps,
+    // and alt-screen TUIs render at whatever size the session was
+    // spawned with — which is why the `--rows` default is tall (60).
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,

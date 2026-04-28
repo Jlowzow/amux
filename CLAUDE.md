@@ -77,6 +77,13 @@ Run `cargo test` after each step to confirm state. Tests go in the same file as 
 - Server spawns a reaper task every 30s to clean dead sessions
 - Logs go to `/tmp/amux-{uid}/daemon.log` (tracing with env filter)
 
+## PTY sizing
+
+- **Detached `amux new` defaults to 80x60** so alt-screen TUIs (claude, vim, htop) inside the session have enough vertical space for `amux top` to render a useful preview in tall terminals. Override with `--rows/-r N` (clamped to [10, 500]); cols default stays 80.
+- **Non-detached `amux new` sizes to the attaching terminal.** The agent's canvas matches your window at spawn time. `--rows` still wins if set.
+- **`amux attach` resizes the PTY** to the attacher's terminal (initial Attach + SIGWINCH → AttachResize). The agent redraws to fit. This is the same trick tmux/screen use.
+- **`amux top` does NOT resize the previewed session's PTY.** Doing so would make every preview refresh repaint the agent inside its own attached window, causing visible flicker. Instead, top requests `CaptureScrollback` with a tall `lines` count and the daemon replays raw scrollback through a temporary tall vt100 parser (bd-pmk). Alt-screen apps still render at their PTY size — that's why bd-is4 made the spawn-time default tall.
+
 ## Multi-agent orchestration (conductor)
 
 This repo dispatches beads to parallel worker agents using **conductor** (`~/Code/conductor`), which sits on top of amux + a file-based mailbox at `/tmp/conductor-mail/`.

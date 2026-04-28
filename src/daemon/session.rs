@@ -771,6 +771,40 @@ mod tests {
         );
     }
 
+    /// Acceptance test for bd-is4: Session::spawn at 80x60 actually produces
+    /// a 60-row PTY end-to-end. The CLI's `--rows` default flows to this
+    /// path; if the row plumbing breaks, alt-screen TUIs (claude, vim) only
+    /// render 24 lines inside `amux top`, defeating the bead's whole point.
+    #[tokio::test]
+    async fn test_spawn_with_60_rows_default() {
+        let session = Session::spawn(
+            "rows-60-test".to_string(),
+            &["stty".to_string(), "size".to_string()],
+            80,
+            60,
+            None,
+            None,
+        )
+        .expect("spawn failed");
+
+        let mut rx = session.output_tx.subscribe();
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(data)) => output.extend_from_slice(&data),
+                _ => break,
+            }
+        }
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("60 80"),
+            "expected '60 80' in stty output, got: {:?}",
+            text
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_with_default_size_fallback() {
         // When cols=0/rows=0, Session::spawn falls back to 80x24.

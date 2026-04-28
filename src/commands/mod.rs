@@ -34,9 +34,10 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
             cwd,
             worktree,
             init_message,
+            rows,
             cmd,
         } => {
-            session::new_session(name, detached, env, cwd, worktree, init_message, cmd)?;
+            session::new_session(name, detached, env, cwd, worktree, init_message, rows, cmd)?;
         }
         Command::Attach { name } => {
             ensure_daemon_running()?;

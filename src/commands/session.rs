@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::cli::DEFAULT_DETACHED_ROWS;
 use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
 use crate::util::{create_git_worktree, ensure_daemon_running, parse_env_vars};
 use crate::client;
@@ -13,6 +14,7 @@ pub fn new_session(
     cwd: Option<String>,
     worktree: Option<String>,
     init_message: Option<String>,
+    rows: Option<u16>,
     cmd: Vec<String>,
 ) -> anyhow::Result<()> {
     if std::env::var("AMUX_DEBUG").is_ok() {
@@ -38,13 +40,20 @@ pub fn new_session(
     let detached = detached || init_message.is_some();
 
     if detached {
+        // Detached sessions default to 80x60 so alt-screen TUIs (claude,
+        // vim) running inside them have enough vertical space for `amux
+        // top` previews. Without this, the daemon's PTY would size to
+        // 80x24 and the agent's rendered frame would only fill 22 rows of
+        // even a tall (60-row) preview pane. See bd-is4. The user can
+        // override with `--rows`; the AttachResize plumbing still resizes
+        // the PTY to the attaching terminal's actual size at attach time.
         let resp = client::request(&ClientMessage::CreateSession {
             name,
             command: cmd,
             env: env_map,
             cwd: cwd.clone(),
             cols: None,
-            rows: None,
+            rows: Some(rows.unwrap_or(DEFAULT_DETACHED_ROWS)),
         })?;
         let session_name = match resp {
             DaemonMessage::SessionCreated { name } => {
@@ -71,14 +80,21 @@ pub fn new_session(
         if std::env::var("AMUX_DEBUG").is_ok() {
             eprintln!("amux-debug: creating session (non-detached)");
         }
+        // Non-detached: spawn at the user's terminal size by default so the
+        // attached view matches the agent's canvas exactly. An explicit
+        // --rows wins (less common — typically used to fix a session at a
+        // larger size than the current window), but the attaching terminal
+        // would override the height again via AttachResize, so honoring the
+        // flag here is mostly cosmetic.
         let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let spawn_rows = rows.unwrap_or(term_rows);
         let resp = client::request(&ClientMessage::CreateSession {
             name: name.clone(),
             command: cmd,
             env: env_map,
             cwd,
             cols: Some(term_cols),
-            rows: Some(term_rows),
+            rows: Some(spawn_rows),
         })?;
         let session_name = match resp {
             DaemonMessage::SessionCreated { name } => {

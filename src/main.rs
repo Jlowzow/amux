@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
             cwd: None,
             worktree: None,
             init_message: None,
+            rows: None,
             cmd: vec![shell],
         }
     });

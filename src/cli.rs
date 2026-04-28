@@ -1,5 +1,26 @@
 use clap::{Parser, Subcommand};
 
+/// Default PTY row count for detached sessions. Must stay in sync with the
+/// docs on the `--rows` flag and CLAUDE.md.
+pub const DEFAULT_DETACHED_ROWS: u16 = 60;
+/// Minimum allowed `--rows` value. Anything smaller is rejected; many TUIs
+/// behave badly below ~10 rows.
+pub const MIN_ROWS: u16 = 10;
+/// Maximum allowed `--rows` value. Way above any real terminal; mostly a
+/// guard against accidental huge values blowing memory in vterm grids.
+pub const MAX_ROWS: u16 = 500;
+
+fn parse_rows(s: &str) -> Result<u16, String> {
+    let n: u16 = s.parse().map_err(|_| format!("'{}' is not a valid row count", s))?;
+    if n < MIN_ROWS || n > MAX_ROWS {
+        return Err(format!(
+            "rows must be in [{}, {}], got {}",
+            MIN_ROWS, MAX_ROWS, n
+        ));
+    }
+    Ok(n)
+}
+
 #[derive(Parser)]
 #[command(name = "amux", about = "AI Agent Multiplexer", version)]
 pub struct Cli {
@@ -38,6 +59,14 @@ pub enum Command {
         /// Send an initial message after the session is ready (implies --detached)
         #[arg(short = 'm', long = "init-message")]
         init_message: Option<String>,
+        /// Initial PTY rows for the session (clamped to [10, 500]).
+        /// When omitted, detached sessions default to 60 rows so alt-screen
+        /// TUIs (claude, vim) have enough vertical space for `amux top`
+        /// previews; non-detached sessions size to the attaching terminal.
+        /// Attaching from a terminal still resizes the PTY via the existing
+        /// AttachResize plumbing.
+        #[arg(short = 'r', long = "rows", value_parser = parse_rows)]
+        rows: Option<u16>,
         /// Command to run
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -290,5 +319,118 @@ mod tests {
             }
             other => panic!("expected New, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_new_rows_flag_long() {
+        let cli = super::Cli::try_parse_from([
+            "amux", "new", "--rows", "100", "--detached", "--", "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::New { rows, .. } => assert_eq!(rows, Some(100)),
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_rows_flag_short() {
+        let cli = super::Cli::try_parse_from([
+            "amux", "new", "-r", "80", "--detached", "--", "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::New { rows, .. } => assert_eq!(rows, Some(80)),
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_rows_default_is_none() {
+        let cli =
+            super::Cli::try_parse_from(["amux", "new", "--detached", "--", "bash"]).unwrap();
+        match cli.command.unwrap() {
+            // None at the CLI level — new_session() applies the 60 default
+            // for detached sessions.
+            super::Command::New { rows, .. } => assert_eq!(rows, None),
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_rows_below_clamp_rejected() {
+        let result = super::Cli::try_parse_from([
+            "amux", "new", "--rows", "5", "--detached", "--", "bash",
+        ]);
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected --rows clamp to fail"),
+        };
+        assert!(
+            err.contains("rows must be in"),
+            "expected clamp error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_new_rows_above_clamp_rejected() {
+        let result = super::Cli::try_parse_from([
+            "amux", "new", "--rows", "501", "--detached", "--", "bash",
+        ]);
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected --rows clamp to fail"),
+        };
+        assert!(
+            err.contains("rows must be in"),
+            "expected clamp error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_new_rows_at_min_accepted() {
+        let cli = super::Cli::try_parse_from([
+            "amux",
+            "new",
+            "--rows",
+            &super::MIN_ROWS.to_string(),
+            "--detached",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::New { rows, .. } => assert_eq!(rows, Some(super::MIN_ROWS)),
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_rows_at_max_accepted() {
+        let cli = super::Cli::try_parse_from([
+            "amux",
+            "new",
+            "--rows",
+            &super::MAX_ROWS.to_string(),
+            "--detached",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::New { rows, .. } => assert_eq!(rows, Some(super::MAX_ROWS)),
+            other => panic!("expected New, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_default_detached_rows_is_60() {
+        // The bead's acceptance criterion is that bare `amux new --detached`
+        // creates a session with 60 rows. That hinges on this constant —
+        // pin it so a future tweak doesn't silently regress the user's
+        // tall-terminal preview experience.
+        assert_eq!(super::DEFAULT_DETACHED_ROWS, 60);
     }
 }

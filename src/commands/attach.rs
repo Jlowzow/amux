@@ -823,4 +823,133 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// End-to-end check that the existing AttachResize plumbing actually
+    /// reshapes the agent's PTY. The bd-is4 design relies on this: a
+    /// detached session spawns at 80x60 by default, and attaching from a
+    /// larger/smaller terminal is supposed to resize the PTY so the agent
+    /// redraws to fit. If this regressed, agents would be stuck at the
+    /// spawn-time canvas and `amux attach` would feel cramped or scroll.
+    #[tokio::test]
+    async fn test_attach_resize_changes_pty_size() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-resize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+
+        // Spawn a loop that prints stty size every 200ms so we can observe
+        // the size change without timing the resize precisely.
+        write_frame_async(
+            &mut w,
+            &ClientMessage::CreateSession {
+                name: Some("resize-test".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "while :; do stty size; sleep 0.2; done".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: Some(80),
+                rows: Some(60),
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        drop(r);
+        drop(w);
+
+        // Open a fresh connection for the attach (the daemon takes ownership
+        // of the conn for streaming).
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::Attach {
+                name: "resize-test".to_string(),
+                cols: 80,
+                rows: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Wait until we see "60 80" (initial size) at least once.
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            let s = String::from_utf8_lossy(&plain);
+                            if s.contains("60 80") { break; }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timeout waiting for initial size '60 80', got: {:?}", String::from_utf8_lossy(&output));
+                }
+            }
+        }
+
+        // Send AttachResize to 100 cols x 40 rows.
+        write_frame_async(
+            &mut writer,
+            &ClientMessage::AttachResize { cols: 100, rows: 40 },
+        )
+        .await
+        .unwrap();
+
+        // Wait for "40 100" to appear in the output stream.
+        output.clear();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw_new_size = false;
+        loop {
+            tokio::select! {
+                msg = try_read_frame_async::<DaemonMessage>(&mut reader) => {
+                    match msg {
+                        Some(Ok(DaemonMessage::Output(data))) => {
+                            output.extend_from_slice(&data);
+                            let plain = strip_ansi(&output);
+                            let s = String::from_utf8_lossy(&plain);
+                            if s.contains("40 100") {
+                                saw_new_size = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(
+            saw_new_size,
+            "AttachResize did not resize PTY: never saw '40 100' in stty output. Got: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        let _ = write_frame_async(&mut writer, &ClientMessage::Detach).await;
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
