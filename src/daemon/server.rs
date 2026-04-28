@@ -402,6 +402,19 @@ async fn handle_connection(
             } => {
                 handle_wait_any(&mut writer, registry.clone(), sessions, timeout_secs).await;
             }
+            ClientMessage::ResizeSession { name, cols, rows } => {
+                let reg = registry.lock().await;
+                if let Some(session) = reg.get(&name) {
+                    let _ = session.resize_tx.send((cols, rows)).await;
+                    let _ = write_frame_async(&mut writer, &DaemonMessage::Ok).await;
+                } else {
+                    let _ = write_frame_async(
+                        &mut writer,
+                        &DaemonMessage::Error(format!("session '{}' not found", name)),
+                    )
+                    .await;
+                }
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,
@@ -422,7 +435,8 @@ async fn handle_attach(
     rows: u16,
 ) {
     // Get session handles (brief lock, no scrollback mutation needed).
-    let (input_tx, mut output_rx, resize_tx, mut exit_rx, scrollback_data) = {
+    // Increment attach_count so `amux top` defers size control to us.
+    let (input_tx, mut output_rx, resize_tx, mut exit_rx, scrollback_data, attach_count) = {
         let reg = registry.lock().await;
         let session = match reg.get(name) {
             Some(s) => s,
@@ -440,6 +454,7 @@ async fn handle_attach(
         let output_rx = session.output_tx.subscribe();
         let resize_tx = session.resize_tx.clone();
         let exit_rx = session.exit_watch.clone();
+        let attach_count = session.attach_count.clone();
         // Read scrollback from the session's Arc (short std::sync::Mutex lock).
         let scrollback = session
             .scrollback
@@ -447,7 +462,9 @@ async fn handle_attach(
             .map(|sb| sb.contents())
             .unwrap_or_default();
 
-        (input_tx, output_rx, resize_tx, exit_rx, scrollback)
+        attach_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        (input_tx, output_rx, resize_tx, exit_rx, scrollback, attach_count)
     };
 
     // Resize to client's terminal size (outside registry lock).
@@ -533,6 +550,8 @@ async fn handle_attach(
     }
 
     reader_task.abort();
+    // Drop attacher count so top regains size control.
+    attach_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 async fn handle_follow(

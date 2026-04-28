@@ -170,7 +170,7 @@ pub fn do_follow(name: &str, plain: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::protocol::codec::{try_read_frame_async, write_frame_async};
-    use crate::protocol::messages::{ClientMessage, DaemonMessage};
+    use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
     use crate::util::strip_ansi;
 
     /// Integration test: verify AttachInput reaches the child process via daemon.
@@ -820,6 +820,253 @@ mod tests {
             DaemonMessage::Error(e) => assert!(e.contains("not found"), "got: {}", e),
             other => panic!("expected Error, got {:?}", other),
         }
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bd-is4: bumping `attach_count` while attached lets `amux top`
+    /// detect that an interactive client owns the size — top defers to
+    /// the attacher and does not send `ResizeSession`. Detach must
+    /// decrement so top regains size control.
+    #[tokio::test]
+    async fn test_attach_count_tracked_in_session_info() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-attach-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Helper to fetch SessionInfo via GetSessionInfo.
+        async fn get_attach_count(sock_path: &std::path::Path, name: &str) -> u32 {
+            let stream = tokio::net::UnixStream::connect(sock_path).await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            write_frame_async(
+                &mut w,
+                &ClientMessage::GetSessionInfo { name: name.to_string() },
+            )
+            .await
+            .unwrap();
+            let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+            match resp {
+                DaemonMessage::SessionDetail(info) => info.attach_count,
+                other => panic!("expected SessionDetail, got {:?}", other),
+            }
+        }
+
+        // Create a session.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::CreateSession {
+                name: Some("ac".to_string()),
+                command: vec!["cat".to_string()],
+                env: None,
+                cwd: None,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        drop(r);
+        drop(w);
+
+        assert_eq!(get_attach_count(&sock_path, "ac").await, 0);
+
+        // Attach in a separate connection.
+        let attach_stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut ar, mut aw) = attach_stream.into_split();
+        write_frame_async(
+            &mut aw,
+            &ClientMessage::Attach {
+                name: "ac".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        // Wait briefly for the attach to register.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(get_attach_count(&sock_path, "ac").await, 1);
+
+        // Detach. The reader_task tear-down decrements attach_count.
+        let _ = write_frame_async(&mut aw, &ClientMessage::Detach).await;
+        // Drain any pending output the daemon flushed before noticing detach.
+        let _ = try_read_frame_async::<DaemonMessage>(&mut ar).await;
+        // Allow the daemon side to finish the loop and decrement.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(get_attach_count(&sock_path, "ac").await, 0);
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bd-is4: ResizeSession is the stateless one-shot resize used by
+    /// `amux top` to match the agent's PTY to the viewer's terminal. It
+    /// must drive TIOCSWINSZ exactly like AttachResize does.
+    #[tokio::test]
+    async fn test_resize_session_changes_pty_size() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-rsz-sess-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Spawn a session that prints stty size on a loop so we can detect
+        // when the resize landed.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::CreateSession {
+                name: Some("rsz".to_string()),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "while :; do stty size; sleep 0.2; done".to_string(),
+                ],
+                env: None,
+                cwd: None,
+                cols: Some(80),
+                rows: Some(24),
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::SessionCreated { .. }));
+        drop(r);
+        drop(w);
+
+        // ResizeSession to 100x80.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::ResizeSession {
+                name: "rsz".to_string(),
+                cols: 100,
+                rows: 80,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(matches!(resp, DaemonMessage::Ok), "got {:?}", resp);
+        drop(r);
+        drop(w);
+
+        // Capture scrollback (raw) and verify "80 100" appears.
+        let mut saw_new_size = false;
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            write_frame_async(
+                &mut w,
+                &ClientMessage::CaptureScrollback {
+                    name: "rsz".to_string(),
+                    lines: 50,
+                    mode: CaptureMode::Raw,
+                },
+            )
+            .await
+            .unwrap();
+            let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+            if let DaemonMessage::CaptureOutput(data) = resp {
+                let plain = strip_ansi(&data);
+                let s = String::from_utf8_lossy(&plain);
+                if s.contains("80 100") {
+                    saw_new_size = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_new_size, "ResizeSession did not change PTY size");
+
+        // SessionInfo should report the new rows/cols too.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::GetSessionInfo { name: "rsz".to_string() },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        match resp {
+            DaemonMessage::SessionDetail(info) => {
+                assert_eq!(info.rows, 80);
+                assert_eq!(info.cols, 100);
+                assert_eq!(info.attach_count, 0);
+            }
+            other => panic!("expected SessionDetail, got {:?}", other),
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bd-is4: ResizeSession on a missing session returns an error rather
+    /// than silently dropping the request.
+    #[tokio::test]
+    async fn test_resize_session_missing_returns_error() {
+        use tokio::sync::broadcast;
+
+        let dir = std::env::temp_dir().join(format!("amux-test-rsz-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let server_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            crate::daemon::server::run_server(listener, server_shutdown).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (mut r, mut w) = stream.into_split();
+        write_frame_async(
+            &mut w,
+            &ClientMessage::ResizeSession {
+                name: "nope".to_string(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        let resp: DaemonMessage = try_read_frame_async(&mut r).await.unwrap().unwrap();
+        assert!(
+            matches!(resp, DaemonMessage::Error(ref e) if e.contains("not found")),
+            "got {:?}",
+            resp
+        );
+
         let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&dir);
     }

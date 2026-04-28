@@ -1,8 +1,5 @@
 use clap::{Parser, Subcommand};
 
-/// Default PTY row count for detached sessions. Must stay in sync with the
-/// docs on the `--rows` flag and CLAUDE.md.
-pub const DEFAULT_DETACHED_ROWS: u16 = 60;
 /// Minimum allowed `--rows` value. Anything smaller is rejected; many TUIs
 /// behave badly below ~10 rows.
 pub const MIN_ROWS: u16 = 10;
@@ -60,11 +57,11 @@ pub enum Command {
         #[arg(short = 'm', long = "init-message")]
         init_message: Option<String>,
         /// Initial PTY rows for the session (clamped to [10, 500]).
-        /// When omitted, detached sessions default to 60 rows so alt-screen
-        /// TUIs (claude, vim) have enough vertical space for `amux top`
-        /// previews; non-detached sessions size to the attaching terminal.
-        /// Attaching from a terminal still resizes the PTY via the existing
-        /// AttachResize plumbing.
+        /// When omitted, the session spawns at the invoking terminal's
+        /// size (or 80x24 if amux was invoked without a tty). `amux top`
+        /// later resizes the PTY to match its own viewer's terminal when
+        /// no client is attached — so the spawn-time size is just a
+        /// starting point, not a ceiling.
         #[arg(short = 'r', long = "rows", value_parser = parse_rows)]
         rows: Option<u16>,
         /// Command to run
@@ -425,12 +422,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_default_detached_rows_is_60() {
-        // The bead's acceptance criterion is that bare `amux new --detached`
-        // creates a session with 60 rows. That hinges on this constant —
-        // pin it so a future tweak doesn't silently regress the user's
-        // tall-terminal preview experience.
-        assert_eq!(super::DEFAULT_DETACHED_ROWS, 60);
-    }
 }

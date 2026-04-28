@@ -244,6 +244,9 @@ mod tests {
                 idle_secs: 30,
                 exit_code: None,
                 output_bytes: 0,
+                rows: 24,
+                cols: 80,
+                attach_count: 0,
             },
             SessionInfo {
                 name: "s2".to_string(),
@@ -256,6 +259,9 @@ mod tests {
                 idle_secs: 1860,
                 exit_code: Some(1),
                 output_bytes: 0,
+                rows: 24,
+                cols: 80,
+                attach_count: 0,
             },
         ]);
         let mut buf = Vec::new();

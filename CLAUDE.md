@@ -79,10 +79,13 @@ Run `cargo test` after each step to confirm state. Tests go in the same file as 
 
 ## PTY sizing
 
-- **Detached `amux new` defaults to 80x60** so alt-screen TUIs (claude, vim, htop) inside the session have enough vertical space for `amux top` to render a useful preview in tall terminals. Override with `--rows/-r N` (clamped to [10, 500]); cols default stays 80.
-- **Non-detached `amux new` sizes to the attaching terminal.** The agent's canvas matches your window at spawn time. `--rows` still wins if set.
-- **`amux attach` resizes the PTY** to the attacher's terminal (initial Attach + SIGWINCH → AttachResize). The agent redraws to fit. This is the same trick tmux/screen use.
-- **`amux top` does NOT resize the previewed session's PTY.** Doing so would make every preview refresh repaint the agent inside its own attached window, causing visible flicker. Instead, top requests `CaptureScrollback` with a tall `lines` count and the daemon replays raw scrollback through a temporary tall vt100 parser (bd-pmk). Alt-screen apps still render at their PTY size — that's why bd-is4 made the spawn-time default tall.
+The agent's PTY size tracks whoever is actively viewing the session:
+
+- **`amux new` spawns at the invoker's terminal size** (or 80x24 if amux can't read a terminal). `--rows/-r N` (clamped to [10, 500]) overrides explicitly. Spawn size is just a starting point — there is no fixed default ceiling.
+- **`amux attach` owns the size while attached.** The initial Attach plus SIGWINCH → AttachResize keep the PTY in lockstep with the attacher's terminal. The session's `attach_count` is incremented for the duration of the attach.
+- **`amux top` resizes the previewed session's PTY to its own terminal** when no client is attached and the agent's current size differs. Resize is gated on size mismatch (won't fire every tick) and on `attach_count == 0` (won't fight an attacher). When the top viewer's window is resized (SIGWINCH triggers a re-render), the next render pass picks up the new `terminal::size()` and propagates. See bd-is4.
+- **`amux top` defers to active attachers.** When `attach_count > 0` top reads the session's current size from `SessionInfo` and renders against that — the attacher controls the canvas.
+- The protocol message used by top is `ClientMessage::ResizeSession { name, cols, rows }`; it's a stateless one-shot resize distinct from `AttachResize` (which only makes sense inside an active attach connection).
 
 ## Multi-agent orchestration (conductor)
 

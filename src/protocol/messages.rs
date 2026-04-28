@@ -89,6 +89,15 @@ pub enum ClientMessage {
         /// Timeout in seconds (0 = wait forever).
         timeout_secs: u64,
     },
+    /// Resize a session's PTY without attaching. Used by `amux top` to
+    /// match the agent's canvas to its viewer's terminal when no client
+    /// is attached. AttachResize is for active attach connections; this
+    /// is for stateless one-shot resizes (bd-is4).
+    ResizeSession {
+        name: String,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// Responses from daemon to client.
@@ -170,4 +179,12 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
     /// Total bytes of PTY output produced by this session.
     pub output_bytes: u64,
+    /// Current PTY rows.
+    pub rows: u16,
+    /// Current PTY cols.
+    pub cols: u16,
+    /// Number of clients currently attached. `amux top` checks this
+    /// before resizing the PTY to its viewer's terminal — when a client
+    /// is attached, the attacher owns the size (bd-is4).
+    pub attach_count: u32,
 }

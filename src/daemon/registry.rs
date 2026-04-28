@@ -87,6 +87,8 @@ impl Registry {
         let last_activity = format_system_time(last_activity_time);
         let exit_code = s.exit_code.lock().ok().and_then(|ec| *ec);
         let output_bytes = s.total_output_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let (rows, cols) = s.current_size.lock().map(|sz| *sz).unwrap_or((24, 80));
+        let attach_count = s.attach_count.load(std::sync::atomic::Ordering::Relaxed);
         SessionInfo {
             name: s.name.clone(),
             command: s.command.clone(),
@@ -98,6 +100,9 @@ impl Registry {
             idle_secs,
             exit_code,
             output_bytes,
+            rows,
+            cols,
+            attach_count,
         }
     }
 

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use crate::cli::DEFAULT_DETACHED_ROWS;
 use crate::protocol::messages::{CaptureMode, ClientMessage, DaemonMessage};
 use crate::util::{create_git_worktree, ensure_daemon_running, parse_env_vars};
 use crate::client;
@@ -40,20 +39,24 @@ pub fn new_session(
     let detached = detached || init_message.is_some();
 
     if detached {
-        // Detached sessions default to 80x60 so alt-screen TUIs (claude,
-        // vim) running inside them have enough vertical space for `amux
-        // top` previews. Without this, the daemon's PTY would size to
-        // 80x24 and the agent's rendered frame would only fill 22 rows of
-        // even a tall (60-row) preview pane. See bd-is4. The user can
-        // override with `--rows`; the AttachResize plumbing still resizes
-        // the PTY to the attaching terminal's actual size at attach time.
+        // Spawn at the invoker's terminal size if we have one, so the
+        // agent's canvas matches whoever is most likely to be looking at
+        // it (the orchestrator running `amux new` from their own
+        // terminal). When `amux top` is later run from a different-sized
+        // terminal, top resizes the PTY on the fly (bd-is4 design pivot)
+        // — the spawn-time size is just a sensible starting point. If
+        // crossterm can't read a terminal (e.g. invoked from a script or
+        // launchd), fall back to 80x24. `--rows` always wins.
+        let term_size = crossterm::terminal::size().ok();
+        let spawn_cols = term_size.map(|(c, _)| c);
+        let spawn_rows = rows.or(term_size.map(|(_, r)| r));
         let resp = client::request(&ClientMessage::CreateSession {
             name,
             command: cmd,
             env: env_map,
             cwd: cwd.clone(),
-            cols: None,
-            rows: Some(rows.unwrap_or(DEFAULT_DETACHED_ROWS)),
+            cols: spawn_cols,
+            rows: spawn_rows,
         })?;
         let session_name = match resp {
             DaemonMessage::SessionCreated { name } => {

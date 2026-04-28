@@ -42,6 +42,14 @@ pub struct Session {
     pub total_output_bytes: Arc<AtomicU64>,
     /// Session-level metadata environment variables (not process env).
     pub env_vars: HashMap<String, String>,
+    /// Active attacher count. `amux top` checks this before resizing the
+    /// session to its viewer's terminal — when an attacher is present,
+    /// the attacher owns the size and top defers (bd-is4 design pivot).
+    pub attach_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Current PTY rows/cols. Updated by io_loop when a resize lands.
+    /// Read by `amux top` to decide whether its viewer terminal differs
+    /// from the agent's canvas.
+    pub current_size: Arc<StdMutex<(u16, u16)>>,
 }
 
 pub struct Scrollback {
@@ -240,6 +248,9 @@ impl Session {
         let died_at_clone = died_at.clone();
         let total_output_bytes = Arc::new(AtomicU64::new(0));
         let total_output_bytes_clone = total_output_bytes.clone();
+        let attach_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let current_size = Arc::new(StdMutex::new((winsize.ws_row, winsize.ws_col)));
+        let current_size_clone = current_size.clone();
 
         // Spawn the I/O task (owns the master fd via OwnedFd).
         tokio::spawn(Self::io_loop(
@@ -256,6 +267,7 @@ impl Session {
             exit_code_clone,
             died_at_clone,
             total_output_bytes_clone,
+            current_size_clone,
         ));
 
         let session = Session {
@@ -275,6 +287,8 @@ impl Session {
             died_at,
             total_output_bytes,
             env_vars: env.unwrap_or_default(),
+            attach_count,
+            current_size,
         };
 
         Ok(session)
@@ -294,6 +308,7 @@ impl Session {
         exit_code: Arc<StdMutex<Option<i32>>>,
         died_at: Arc<StdMutex<Option<std::time::SystemTime>>>,
         total_output_bytes: Arc<AtomicU64>,
+        current_size: Arc<StdMutex<(u16, u16)>>,
     ) {
         // Wrap the master fd in async I/O (fd must already be non-blocking).
         let master_file = unsafe { OwnedFd::from_raw_fd(master_fd) };
@@ -416,6 +431,9 @@ impl Session {
                     }
                     if let Ok(mut vt) = vterm.lock() {
                         vt.resize(rows, cols);
+                    }
+                    if let Ok(mut sz) = current_size.lock() {
+                        *sz = (rows, cols);
                     }
                 }
                 // Kill signal.
@@ -772,9 +790,9 @@ mod tests {
     }
 
     /// Acceptance test for bd-is4: Session::spawn at 80x60 actually produces
-    /// a 60-row PTY end-to-end. The CLI's `--rows` default flows to this
-    /// path; if the row plumbing breaks, alt-screen TUIs (claude, vim) only
-    /// render 24 lines inside `amux top`, defeating the bead's whole point.
+    /// a 60-row PTY end-to-end. The CLI passes the spawning client's terminal
+    /// size (or `--rows` if set) here; if the row plumbing breaks, alt-screen
+    /// TUIs render at the wrong size and the top-driven resize can't recover.
     #[tokio::test]
     async fn test_spawn_with_60_rows_default() {
         let session = Session::spawn(

@@ -366,6 +366,20 @@ fn top_loop(stdout: &mut io::Stdout) -> anyhow::Result<()> {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let layout = compute_layout(sorted.len() as u16, rows);
 
+        // Resize the previewed session's PTY to match our terminal so its
+        // alt-screen TUI repaints at full preview height (bd-is4). Skip if
+        // an interactive client is attached — they own the size.
+        // `fetch_scrollback` is called immediately after, but the agent is
+        // unlikely to repaint that fast; the next refresh tick will pick
+        // up the redraw. That latency is fine for a 200ms-1s top loop.
+        if let Some(target) = sorted.get(selected) {
+            if target.attach_count == 0
+                && (target.rows != rows || target.cols != cols)
+            {
+                let _ = resize_session(&target.name, cols, rows);
+            }
+        }
+
         // Ask the daemon for enough lines to fill the preview pane. The
         // daemon replays raw scrollback through a tall vt100 parser to
         // recover history past the agent's PTY size (bd-pmk). A small
@@ -585,19 +599,27 @@ fn fetch_sessions() -> anyhow::Result<Vec<SessionInfo>> {
     }
 }
 
+/// Ask the daemon to resize a session's PTY. Used by the top loop to
+/// match the agent's canvas to its viewer's terminal when no interactive
+/// client is attached (bd-is4). Errors swallow silently — a resize that
+/// fails will just be retried next tick if the size is still wrong.
+fn resize_session(name: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
+    let resp = client::request(&ClientMessage::ResizeSession {
+        name: name.to_string(),
+        cols,
+        rows,
+    })?;
+    match resp {
+        DaemonMessage::Ok => Ok(()),
+        DaemonMessage::Error(e) => anyhow::bail!(e),
+        _ => anyhow::bail!("unexpected response"),
+    }
+}
+
 fn fetch_scrollback(name: &str, lines: usize) -> anyhow::Result<Vec<u8>> {
     // Formatted mode: rendered screen with SGR color codes preserved, cursor
     // positioning stripped. This lets the preview show the target's colors
     // (e.g. claude's UI) rather than monochrome text.
-    //
-    // We deliberately do NOT send a resize message to the previewed
-    // session here (bd-is4). Resizing on every preview refresh would
-    // cause the agent process to repaint at the new size every tick,
-    // producing visible flicker inside any attached window and pointless
-    // SIGWINCH churn. Instead the daemon replays raw scrollback through
-    // a temporary tall vt100 parser (bd-pmk) for streaming-output apps,
-    // and alt-screen TUIs render at whatever size the session was
-    // spawned with — which is why the `--rows` default is tall (60).
     let resp = client::request(&ClientMessage::CaptureScrollback {
         name: name.to_string(),
         lines,
@@ -627,6 +649,9 @@ mod tests {
             idle_secs: idle,
             exit_code,
             output_bytes: 0,
+            rows: 24,
+            cols: 80,
+            attach_count: 0,
         }
     }
 
