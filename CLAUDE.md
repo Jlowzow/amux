@@ -125,6 +125,44 @@ A `\x1b[2J\x1b[H` clear-screen sequence is broadcast on the unchanged
 output_tx at the boundary so any subscriber whose stream straddles the
 respawn gets a clean visual reset rather than mixed pre/post bytes.
 
+## Wrapping the orchestrator in amux for /handoff (bd-uhp)
+
+For `/handoff` to cycle the orchestrator's own claude in place, the
+orchestrator must be running inside an amux session. Launch pattern:
+
+```
+amux new -n orchestrator -- claude
+amux attach -t orchestrator
+```
+
+Then in the attached claude, `/handoff` will:
+
+1. Stage `handoff.msg` in the conductor mailbox (existing slash-command
+   behavior).
+2. Detect `$AMUX_SESSION` and `exec amux handoff --prime /conductor`,
+   which respawns the session's claude with a fresh context and
+   `/conductor` as its first message.
+
+The detached attach view stays open, the new claude lights up in place,
+and the conductor template loads `handoff.msg` as its first action.
+
+When the orchestrator is **not** wrapped in amux, `/handoff` falls back
+to the manual flow (user closes the window or runs `/clear`).
+
+Building blocks:
+
+- `AMUX_SESSION=<name>` is exported into every spawned/respawned
+  child's env, so any process inside the session — slash commands,
+  shell snippets, mailers — can discover its session name.
+- `amux current` prints `$AMUX_SESSION` (exit 1 if unset). Pure-stdlib
+  helper, no daemon roundtrip.
+- `amux handoff -n <name> [--message <text>] [--prime <prompt>]
+  [-- <cmd...>]` is the higher-level wrapper around RespawnSession.
+  When `-n` is omitted it uses `$AMUX_SESSION`. With `--message` it
+  atomically writes `<runtime_dir>/handoff/<name>.msg` (via tempfile +
+  rename) before respawning. With no positional command it defaults to
+  `claude` (and forwards `--prime` as claude's first message arg).
+
 ## Multi-agent orchestration (conductor)
 
 This repo dispatches beads to parallel worker agents using **conductor** (`~/Code/conductor`), which sits on top of amux + a file-based mailbox at `/tmp/conductor-mail/`.
