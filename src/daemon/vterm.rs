@@ -12,15 +12,26 @@
 
 use vt100::Color;
 
+/// Number of rows the live parser keeps in its internal scrollback. When
+/// streaming output scrolls past the live screen, those rows move into this
+/// buffer and remain queryable for tall preview captures (bd-pmk). 200 rows
+/// is enough for any reasonable preview height; per-cell vt100 storage caps
+/// memory at well under a megabyte per session even at 200x200.
+const PARSER_SCROLLBACK_ROWS: usize = 200;
+
 pub struct VirtualTerminal {
     parser: vt100::Parser,
 }
 
 impl VirtualTerminal {
     /// Create a new virtual terminal with the given dimensions.
+    ///
+    /// The internal vt100 parser retains `PARSER_SCROLLBACK_ROWS` rows of
+    /// scrolled-off content so streaming output exceeding the screen height
+    /// can still be recovered for preview / capture (bd-pmk).
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, PARSER_SCROLLBACK_ROWS),
         }
     }
 
@@ -35,6 +46,7 @@ impl VirtualTerminal {
     }
 
     /// Return the emulator's current grid size as `(rows, cols)`.
+    #[allow(dead_code)]
     pub fn size(&self) -> (u16, u16) {
         self.parser.screen().size()
     }
@@ -69,6 +81,132 @@ impl VirtualTerminal {
         lines[start..].join("\n")
     }
 
+    /// Return the last `n` non-empty lines of the rendered screen plus the
+    /// parser's internal scrollback, formatted with SGR codes.
+    ///
+    /// Reads from the LIVE parser maintained by the daemon's io_loop, which
+    /// has tracked every byte the agent has written and therefore reflects
+    /// the agent's actual current display state. This is the correct source
+    /// for preview / capture: cursor-addressed redraws (e.g. claude's main-
+    /// screen partial repaints) are interpreted in their full byte context,
+    /// not from a sliding ring buffer that may have evicted earlier setup
+    /// (bd-8w7).
+    ///
+    /// Lines that scrolled off the screen come from the parser's internal
+    /// scrollback (configured at construction time) so streaming output
+    /// past the screen height is still available (bd-pmk).
+    ///
+    /// Mutates the parser's `set_scrollback` offset while reading and
+    /// restores it before returning. The caller must hold a `&mut` lock.
+    pub fn rendered_recent_formatted(&mut self, n: usize) -> Vec<u8> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let saved_offset = self.parser.screen().scrollback();
+        let (rows, cols) = self.parser.screen().size();
+        let screen_rows = rows as usize;
+
+        // Probe actual scrollback length by clamping past max — the vt100
+        // crate clamps to the real scrollback size internally.
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let scrollback_len = self.parser.screen().scrollback();
+
+        // Total rows available to walk, oldest first.
+        let total = scrollback_len + screen_rows;
+        let mut row_texts: Vec<String> = Vec::with_capacity(total);
+
+        // Walk scrollback in batches of `screen_rows`. When set_scrollback(N)
+        // is in effect, the parser's visible_rows iterator shows scrollback
+        // rows starting at index (scrollback_len - N), then chains with the
+        // top of the live screen. For purely-scrollback batches (N >=
+        // screen_rows) we read all `screen_rows` cells from positions
+        // (scrollback_len - N) .. (scrollback_len - N + screen_rows).
+        let mut scrollback_consumed = 0usize;
+        while scrollback_consumed < scrollback_len {
+            let offset = scrollback_len - scrollback_consumed;
+            self.parser.screen_mut().set_scrollback(offset);
+            let take = screen_rows.min(scrollback_len - scrollback_consumed);
+            let screen = self.parser.screen();
+            for r in 0..take {
+                let mut text = String::new();
+                for c in 0..cols {
+                    if let Some(cell) = screen.cell(r as u16, c) {
+                        if !cell.is_wide_continuation() {
+                            text.push_str(cell.contents());
+                        }
+                    }
+                }
+                row_texts.push(text);
+            }
+            scrollback_consumed += take;
+        }
+
+        // Read current screen rows.
+        self.parser.screen_mut().set_scrollback(0);
+        {
+            let screen = self.parser.screen();
+            for r in 0..screen_rows {
+                let mut text = String::new();
+                for c in 0..cols {
+                    if let Some(cell) = screen.cell(r as u16, c) {
+                        if !cell.is_wide_continuation() {
+                            text.push_str(cell.contents());
+                        }
+                    }
+                }
+                row_texts.push(text);
+            }
+        }
+
+        // Restore original scrollback offset before any early return.
+        self.parser.screen_mut().set_scrollback(saved_offset);
+
+        // Pick the last `n` non-blank rows by their position in the walk.
+        let non_blank: Vec<usize> = row_texts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if non_blank.is_empty() {
+            return Vec::new();
+        }
+        let start = non_blank.len().saturating_sub(n);
+        let selected = &non_blank[start..];
+
+        // Format the selected rows. To minimise scrollback offset churn we
+        // group reads by the offset they require, then format in walk order.
+        // A row at total index `t`:
+        //   - t < scrollback_len  → set_scrollback(scrollback_len - t), row 0
+        //   - t >= scrollback_len → set_scrollback(0), row (t - scrollback_len)
+        let mut out = Vec::new();
+        for (i, &t) in selected.iter().enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            if t < scrollback_len {
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(scrollback_len - t);
+                write_row_sgr(&mut out, self.parser.screen(), 0, cols);
+            } else {
+                self.parser.screen_mut().set_scrollback(0);
+                write_row_sgr(
+                    &mut out,
+                    self.parser.screen(),
+                    (t - scrollback_len) as u16,
+                    cols,
+                );
+            }
+        }
+        out.extend_from_slice(b"\x1b[0m");
+
+        // Final restore (the format pass moved the offset around).
+        self.parser.screen_mut().set_scrollback(saved_offset);
+
+        out
+    }
+
     /// Return the last `n` non-empty lines of the rendered screen, with SGR
     /// (color/attribute) escape codes preserved. No cursor-positioning codes
     /// are emitted — callers are responsible for placing the cursor.
@@ -78,6 +216,9 @@ impl VirtualTerminal {
     /// with SGR reset so callers need not emit one themselves.
     ///
     /// Bounded by the live screen size; see note on `rendered_last_lines`.
+    /// Prefer `rendered_recent_formatted` for preview / capture: it includes
+    /// the parser's scrollback rows for streaming output that has scrolled
+    /// off the live screen.
     #[allow(dead_code)]
     pub fn rendered_last_lines_formatted(&self, n: usize) -> Vec<u8> {
         if n == 0 {
@@ -145,6 +286,7 @@ impl VirtualTerminal {
 /// - The first few rows of the replay may show partial state if the raw
 ///   scrollback ring buffer's oldest bytes start mid-escape. Acceptable
 ///   for a preview pane.
+#[allow(dead_code)]
 pub fn render_raw_scrollback_formatted(
     raw: &[u8],
     rows: u16,
@@ -705,5 +847,131 @@ mod tests {
         let plain = strip_escapes(&out);
         assert!(!plain.contains("garbage"), "got: {:?}", plain);
         assert!(plain.contains("FINAL: hello"), "got: {:?}", plain);
+    }
+
+    // ---- rendered_recent_formatted: snapshot of live screen + parser scrollback ----
+
+    /// bd-8w7 root cause regression: when an agent redraws using cursor
+    /// positioning + clear-line (claude's pattern), the OLD scrollback-replay
+    /// path produced a different rendering on every capture because the 64KB
+    /// raw ring slid past the most recent full UI redraw. With the live-VT
+    /// snapshot path, two consecutive captures of an idle (post-redraw) agent
+    /// must be byte-identical because the live parser holds the agent's true
+    /// current screen state.
+    #[test]
+    fn recent_formatted_consecutive_captures_idle_session_are_identical() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // Simulate a TUI that draws a multi-line UI, then sits idle. Cursor
+        // jumps around, lines get rewritten with CSI K, etc.
+        vt.process(b"\x1b[H\x1b[2J");
+        vt.process(b"\x1b[1;1HHEADER\x1b[K");
+        vt.process(b"\x1b[3;1Hcontent line A\x1b[K");
+        vt.process(b"\x1b[4;1Hcontent line B\x1b[K");
+        vt.process(b"\x1b[24;1HTOOLBAR\x1b[K");
+        // Many partial repaints of just the toolbar (claude's spinner pattern).
+        for _ in 0..20 {
+            vt.process(b"\x1b[24;1HTOOLBAR\x1b[K");
+        }
+
+        let cap1 = vt.rendered_recent_formatted(40);
+        let cap2 = vt.rendered_recent_formatted(40);
+        assert_eq!(cap1, cap2, "consecutive idle captures must be identical");
+    }
+
+    /// bd-8w7 symptom regression: capturing a session that uses cursor-
+    /// addressed redraws must return the agent's current screen state in
+    /// full — not just the rows that received the most recent partial
+    /// repaint. The OLD replay path would lose the static rows because the
+    /// fresh parser only saw the partial-repaint bytes.
+    #[test]
+    fn recent_formatted_returns_full_screen_for_cursor_addressed_tui() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // Initial full UI paint (CSI commands address every region).
+        vt.process(b"\x1b[H\x1b[2J");
+        vt.process(b"\x1b[1;1HHEADER\x1b[K");
+        vt.process(b"\x1b[3;1Hbody row 1\x1b[K");
+        vt.process(b"\x1b[4;1Hbody row 2\x1b[K");
+        vt.process(b"\x1b[5;1Hbody row 3\x1b[K");
+        vt.process(b"\x1b[24;1HTOOLBAR\x1b[K");
+        // Followed by many partial repaints — exactly the claude spinner case.
+        for i in 0..50 {
+            vt.process(format!("\x1b[24;1HTOOLBAR {i}\x1b[K").as_bytes());
+        }
+
+        let out = vt.rendered_recent_formatted(40);
+        let plain = strip_escapes(&out);
+        assert!(plain.contains("HEADER"), "missing HEADER: {plain:?}");
+        assert!(plain.contains("body row 1"), "missing body row 1: {plain:?}");
+        assert!(plain.contains("body row 2"), "missing body row 2: {plain:?}");
+        assert!(plain.contains("body row 3"), "missing body row 3: {plain:?}");
+        assert!(plain.contains("TOOLBAR"), "missing TOOLBAR: {plain:?}");
+    }
+
+    /// bd-pmk regression guard: streaming output that scrolls past the
+    /// agent's PTY size should still be recoverable in tall captures via
+    /// the live parser's internal scrollback (configured at construction).
+    #[test]
+    fn recent_formatted_recovers_lines_scrolled_past_screen() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        // 80 lines into a 24-row screen — last 24 visible, first 56 in
+        // parser scrollback (we configured 200 rows of scrollback).
+        for i in 1..=80 {
+            vt.process(format!("line {i}\r\n").as_bytes());
+        }
+        let out = vt.rendered_recent_formatted(60);
+        let plain = strip_escapes(&out);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert!(
+            lines.len() >= 55,
+            "expected at least 55 recovered lines, got {} (lines={:?})",
+            lines.len(),
+            lines,
+        );
+        assert_eq!(
+            *lines.last().unwrap(),
+            "line 80",
+            "tail must be the most recent line"
+        );
+    }
+
+    #[test]
+    fn recent_formatted_n_zero_returns_empty() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"hello\r\nworld\r\n");
+        assert!(vt.rendered_recent_formatted(0).is_empty());
+    }
+
+    #[test]
+    fn recent_formatted_short_session_returns_only_written_lines() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"a\r\nb\r\nc\r\n");
+        let out = vt.rendered_recent_formatted(50);
+        let plain = strip_escapes(&out);
+        assert_eq!(plain, "a\nb\nc");
+    }
+
+    #[test]
+    fn recent_formatted_preserves_sgr_colors() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[31mred line\x1b[0m");
+        let out = vt.rendered_recent_formatted(5);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("red line"), "missing text: {text:?}");
+        assert!(
+            text.contains("\x1b[") && (text.contains(";31") || text.contains("[31")),
+            "expected SGR red code in {text:?}"
+        );
+    }
+
+    #[test]
+    fn recent_formatted_ends_with_reset() {
+        let mut vt = VirtualTerminal::new(24, 80);
+        vt.process(b"\x1b[31mred\x1b[0m");
+        let out = vt.rendered_recent_formatted(5);
+        assert!(
+            out.ends_with(b"\x1b[0m"),
+            "expected trailing reset, got tail: {:?}",
+            &out[out.len().saturating_sub(8)..]
+        );
     }
 }

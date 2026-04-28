@@ -215,45 +215,30 @@ async fn handle_connection(
                             .lock()
                             .map(|sb| sb.last_lines(lines))
                             .unwrap_or_default(),
-                        // Plain and Formatted both replay the raw scrollback
-                        // ring through a temporary vt100 parser sized to fit
-                        // the requested line count. This recovers history
-                        // beyond the agent's PTY rows (e.g. for amux top's
-                        // preview pane in tall terminals — bd-pmk).
+                        // Plain and Formatted snapshot the LIVE vt100 parser
+                        // (which has tracked every byte the agent has written)
+                        // rather than replaying the 64KB scrollback ring
+                        // through a fresh parser. The replay path produced
+                        // jitter against cursor-addressed redraws like claude:
+                        // once the ring evicted the most recent full UI
+                        // redraw, partial updates left most rows blank in the
+                        // fresh parser, and the captured screen shifted as
+                        // bytes flowed (bd-8w7). The live parser also keeps
+                        // its own scrollback for streaming output that has
+                        // scrolled past the screen (bd-pmk).
                         CaptureMode::Plain => {
-                            let raw = session
-                                .scrollback
-                                .lock()
-                                .map(|sb| sb.contents())
-                                .unwrap_or_default();
-                            let cols = session
+                            let formatted = session
                                 .vterm
                                 .lock()
-                                .map(|vt| vt.size().1)
-                                .unwrap_or(80);
-                            let target_rows = (lines as u16).max(24);
-                            let formatted = crate::daemon::vterm::render_raw_scrollback_formatted(
-                                &raw, target_rows, cols, lines,
-                            );
-                            // Strip escape codes for Plain mode.
+                                .map(|mut vt| vt.rendered_recent_formatted(lines))
+                                .unwrap_or_default();
                             strip_csi_escapes(&formatted)
                         }
-                        CaptureMode::Formatted => {
-                            let raw = session
-                                .scrollback
-                                .lock()
-                                .map(|sb| sb.contents())
-                                .unwrap_or_default();
-                            let cols = session
-                                .vterm
-                                .lock()
-                                .map(|vt| vt.size().1)
-                                .unwrap_or(80);
-                            let target_rows = (lines as u16).max(24);
-                            crate::daemon::vterm::render_raw_scrollback_formatted(
-                                &raw, target_rows, cols, lines,
-                            )
-                        }
+                        CaptureMode::Formatted => session
+                            .vterm
+                            .lock()
+                            .map(|mut vt| vt.rendered_recent_formatted(lines))
+                            .unwrap_or_default(),
                     };
                     let _ =
                         write_frame_async(&mut writer, &DaemonMessage::CaptureOutput(data)).await;
