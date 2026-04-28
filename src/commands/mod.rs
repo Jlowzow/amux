@@ -1,5 +1,6 @@
 mod attach;
 mod query;
+mod respawn;
 mod server;
 mod session;
 mod top;
@@ -99,6 +100,10 @@ pub fn dispatch(command: Command) -> anyhow::Result<()> {
         }
         Command::Capture { name, lines, raw, plain: _ } => {
             session::capture_scrollback(&name, lines, !raw)?;
+        }
+        Command::Respawn { name, cwd, env, cmd } => {
+            ensure_daemon_running()?;
+            respawn::do_respawn(&name, cwd, env, cmd)?;
         }
         Command::Env { action } => {
             ensure_daemon_running()?;

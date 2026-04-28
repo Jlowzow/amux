@@ -94,6 +94,37 @@ The agent's PTY size tracks whoever is actively viewing the session:
 - **`i` opens a single-line input box** at the bottom of the screen targeting the currently highlighted session. Type, then Enter to send `<text>\r` (same byte sequence `amux send` produces). Esc / Ctrl-C cancels without sending. The input box overlays the summary/help row; the table and preview keep refreshing in the background. The selected row is frozen for the duration of input mode so the target the user saw when they pressed `i` is the target Enter sends to. Empty buffer + Enter sends just `\r` — the "nudge with Enter" shortcut.
 - **`amux send` reads stdin when no text args are passed.** `echo hi | amux send -t Worker` forwards `hi\n` verbatim — no `\r` is appended (piped bytes are authoritative; if you wanted no terminator use `echo -n`). With text args the old behavior is unchanged: args are joined with spaces and a trailing `\r` is appended unless `--literal`. As a safety guard, `amux send -t Worker` with no args **and** an interactive stdin errors out instead of blocking on `read_to_end` waiting for Ctrl-D.
 
+## Respawning sessions (RespawnSession)
+
+`amux respawn -n <name> -- <cmd...>` atomically replaces a session's child
+process while preserving the session itself. Equivalent to `tmux respawn-pane -k`.
+
+Used by:
+- Orchestrator /handoff: cycle the orchestrator's claude with fresh context
+  after staging a handoff message — the same amux session keeps its name,
+  attached client, and TTY size.
+- Worker handoff pipelines: a finishing worker can kick off a different agent
+  in the same amux session with a follow-up prompt, chaining work without
+  leaking session bookkeeping.
+
+Behavior:
+- SIGKILLs the current child, opens a fresh PTY, forks+execs the new command.
+- Scrollback and vterm parser are reset (fresh start).
+- attach_count, current_size, and the session name carry over so attached
+  clients keep their connection and see new output without resizing.
+- AMUX_SESSION=<name> is always exported in the new child's env.
+- respawn_count increments and is surfaced on SessionInfo for telemetry.
+
+Implementation lives in `Session::respawn` (`src/daemon/session.rs`); the
+server holds the registry mutex for the entire respawn so the watchdog
+reaper, attach connections, and concurrent `amux respawn` calls see a
+coherent mid-swap state. The io_loop checks a shared `respawn_in_progress`
+flag and skips death-recording (exit_code, died_at, exit_watch.send(true))
+when it's set, so attached clients don't see the swap as a SessionEnded.
+A `\x1b[2J\x1b[H` clear-screen sequence is broadcast on the unchanged
+output_tx at the boundary so any subscriber whose stream straddles the
+respawn gets a clean visual reset rather than mixed pre/post bytes.
+
 ## Multi-agent orchestration (conductor)
 
 This repo dispatches beads to parallel worker agents using **conductor** (`~/Code/conductor`), which sits on top of amux + a file-based mailbox at `/tmp/conductor-mail/`.

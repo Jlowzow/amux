@@ -192,6 +192,25 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Atomically replace a session's child process with a new command,
+    /// preserving the session name and any attached clients' output
+    /// stream. Equivalent to `tmux respawn-pane -k`. See bd-wh4.
+    Respawn {
+        /// Target session name
+        #[arg(short = 'n', long = "name", visible_alias = "target", short_alias = 't')]
+        name: String,
+        /// Working directory for the new child (defaults to the
+        /// session's original cwd)
+        #[arg(short = 'c', long = "cwd")]
+        cwd: Option<String>,
+        /// Set environment variable (KEY=VALUE), can be specified
+        /// multiple times. Always merged with `AMUX_SESSION=<name>`.
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Command to run (the first element is the program)
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Ping the server (health check)
     Ping,
 }
@@ -402,6 +421,71 @@ mod tests {
             super::Command::New { rows, .. } => assert_eq!(rows, Some(super::MIN_ROWS)),
             other => panic!("expected New, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_respawn_parses_minimal() {
+        let cli = super::Cli::try_parse_from([
+            "amux", "respawn", "-n", "Worker", "--", "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::Respawn { name, cwd, env, cmd } => {
+                assert_eq!(name, "Worker");
+                assert!(cwd.is_none());
+                assert!(env.is_empty());
+                assert_eq!(cmd, vec!["bash"]);
+            }
+            other => panic!("expected Respawn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respawn_parses_with_cwd_and_env() {
+        let cli = super::Cli::try_parse_from([
+            "amux",
+            "respawn",
+            "-n",
+            "agent",
+            "--cwd",
+            "/tmp",
+            "-e",
+            "FOO=bar",
+            "-e",
+            "BAZ=qux",
+            "--",
+            "claude",
+            "--continue",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::Respawn { name, cwd, env, cmd } => {
+                assert_eq!(name, "agent");
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(env, vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]);
+                assert_eq!(cmd, vec!["claude", "--continue"]);
+            }
+            other => panic!("expected Respawn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respawn_target_alias() {
+        // -t alias should also work (consistent with kill, send, etc.)
+        let cli = super::Cli::try_parse_from([
+            "amux", "respawn", "-t", "agent", "--", "bash",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            super::Command::Respawn { name, .. } => assert_eq!(name, "agent"),
+            other => panic!("expected Respawn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_respawn_requires_command() {
+        let result = super::Cli::try_parse_from(["amux", "respawn", "-n", "x"]);
+        assert!(result.is_err(), "respawn must require a command");
     }
 
     #[test]

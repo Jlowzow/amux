@@ -247,6 +247,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 attach_count: 0,
+                respawn_count: 0,
             },
             SessionInfo {
                 name: "s2".to_string(),
@@ -262,6 +263,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 attach_count: 0,
+                respawn_count: 0,
             },
         ]);
         let mut buf = Vec::new();

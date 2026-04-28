@@ -98,6 +98,16 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// Atomically replace a session's child process with a new command,
+    /// preserving the session name, registry slot, attached clients'
+    /// output stream, and current PTY size. Equivalent to
+    /// `tmux respawn-pane -k`. See bd-wh4.
+    RespawnSession {
+        name: String,
+        command: Vec<String>,
+        cwd: Option<String>,
+        env: Option<HashMap<String, String>>,
+    },
 }
 
 /// Responses from daemon to client.
@@ -187,4 +197,8 @@ pub struct SessionInfo {
     /// before resizing the PTY to its viewer's terminal — when a client
     /// is attached, the attacher owns the size (bd-is4).
     pub attach_count: u32,
+    /// Number of times this session has been atomically replaced via
+    /// `RespawnSession`. Bumped each time `amux respawn` swaps the
+    /// child in place; surfaced for telemetry (bd-wh4).
+    pub respawn_count: u32,
 }

@@ -400,6 +400,31 @@ async fn handle_connection(
                     .await;
                 }
             }
+            ClientMessage::RespawnSession { name, command, cwd, env } => {
+                // Hold the registry lock for the entire respawn so the
+                // reaper, watchdog, and other clients see a coherent
+                // mid-swap state. respawn() is bounded (a few hundred ms
+                // at most: SIGKILL → waitpid → openpty → fork+exec) and
+                // it's a rare operation, so the brief serialization is
+                // acceptable. See bd-wh4 race-conditions section.
+                let mut reg = registry.lock().await;
+                let result = match reg.get_mut(&name) {
+                    Some(session) => session.respawn(&command, env, cwd).await,
+                    None => Err(anyhow::anyhow!("session '{}' not found", name)),
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = write_frame_async(&mut writer, &DaemonMessage::Ok).await;
+                    }
+                    Err(e) => {
+                        let _ = write_frame_async(
+                            &mut writer,
+                            &DaemonMessage::Error(e.to_string()),
+                        )
+                        .await;
+                    }
+                }
+            }
             _ => {
                 let _ = write_frame_async(
                     &mut writer,

@@ -89,6 +89,7 @@ impl Registry {
         let output_bytes = s.total_output_bytes.load(std::sync::atomic::Ordering::Relaxed);
         let (rows, cols) = s.current_size.lock().map(|sz| *sz).unwrap_or((24, 80));
         let attach_count = s.attach_count.load(std::sync::atomic::Ordering::Relaxed);
+        let respawn_count = s.respawn_count.load(std::sync::atomic::Ordering::Relaxed);
         SessionInfo {
             name: s.name.clone(),
             command: s.command.clone(),
@@ -103,6 +104,7 @@ impl Registry {
             rows,
             cols,
             attach_count,
+            respawn_count,
         }
     }
 

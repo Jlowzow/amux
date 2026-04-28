@@ -791,6 +791,7 @@ mod tests {
             rows: 24,
             cols: 80,
             attach_count: 0,
+            respawn_count: 0,
         }
     }
 
